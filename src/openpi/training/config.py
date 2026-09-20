@@ -19,6 +19,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.molmospaces_policy as molmospaces_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -463,6 +464,34 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotMolmoSpacesDataConfig(DataConfigFactory):
+    """MolmoSpaces multi-view LeRobot datasets (see mlspaces_multiview_to_lerobot.py).
+
+    The datasets store absolute joint targets, so the joints are converted to deltas to match what
+    the *_jointpos checkpoints predict (their inference-time AbsoluteActions undoes this).
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(inputs=[molmospaces_policy.MolmoSpacesToDroid()])
+        data_transforms = _transforms.Group(
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            outputs=[droid_policy.DroidOutputs()],
+        )
+        delta_action_mask = _transforms.make_bool_mask(7, -1)  # joints delta, gripper absolute
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -648,6 +677,26 @@ _CONFIGS = [
     # are using, and other hyperparameters like how many training steps to run or what learning rate to use.
     # For your own dataset, you can copy this class and modify the dataset name, and data transforms based on
     # the comments below.
+    # Copied from github.com/omarrayyann/openpi (the fork molmospaces uses): pi05_droid fine-tuned
+    # on joint-position actions. The model predicts joint deltas; AbsoluteActions adds the current
+    # joint state so the server returns absolute joint positions (gripper stays absolute).
+    TrainConfig(
+        name="pi05_droid_jointpos",
+        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        data=SimpleDataConfig(
+            assets=AssetsConfig(asset_id="droid"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
+                outputs=[
+                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
+                    droid_policy.DroidOutputs(),
+                ],
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+    ),
     TrainConfig(
         # Change the name to reflect your model and dataset.
         name="pi0_libero",
@@ -915,6 +964,39 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    # LoRA fine-tune of pi05_droid_jointpos on a MolmoSpaces multi-view dataset.
+    # Dataset is resolved through HF_LEROBOT_HOME (see /data/haotian/lerobot_home).
+    TrainConfig(
+        name="pi05_droid_jointpos_molmospaces_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotMolmoSpacesDataConfig(
+            repo_id="local/pick_kettle_multiview",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(
+                # Reuse the original DROID norm stats, as the DROID fine-tune example does.
+                assets_dir="/home/haotian/openpi/checkpoints/pi05_droid_jointpos/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/haotian/openpi/checkpoints/pi05_droid_jointpos/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,  # LoRA fine-tuning does not use EMA
+        num_train_steps=20_000,
+        batch_size=8,
+        save_interval=2_000,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
