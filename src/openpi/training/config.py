@@ -3,6 +3,7 @@
 import abc
 from collections.abc import Sequence
 import dataclasses
+import os
 import difflib
 import logging
 import pathlib
@@ -461,6 +462,13 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+# Directory holding the pi05_droid_jointpos checkpoint (assets/ and params/). Override with
+# PI05_JOINTPOS_DIR so the same config works on machines that store it elsewhere.
+PI05_JOINTPOS_DIR = os.environ.get(
+    "PI05_JOINTPOS_DIR", "/home/haotian/openpi/checkpoints/pi05_droid_jointpos"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -980,12 +988,12 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
             assets=AssetsConfig(
                 # Reuse the original DROID norm stats, as the DROID fine-tune example does.
-                assets_dir="/home/haotian/openpi/checkpoints/pi05_droid_jointpos/assets",
+                assets_dir=f"{PI05_JOINTPOS_DIR}/assets",
                 asset_id="droid",
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/home/haotian/openpi/checkpoints/pi05_droid_jointpos/params"
+            f"{PI05_JOINTPOS_DIR}/params"
         ),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
