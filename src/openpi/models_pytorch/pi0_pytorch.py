@@ -314,8 +314,12 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+    def forward(self, observation, actions, noise=None, time=None, positions_4d=None) -> Tensor:
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)
+
+        ``positions_4d``: optional (B, L, 4) continuous (x, y, z, t) positions covering the
+        full prefix+suffix token sequence, enabling 4D RoPE in place of the stock 1D RoPE.
+        """
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
@@ -347,7 +351,15 @@ class PI0Pytorch(nn.Module):
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+        if positions_4d is not None:
+            expected = pad_masks.shape[1]
+            if positions_4d.shape[1] != expected:
+                raise ValueError(
+                    f"positions_4d must cover the full prefix+suffix sequence of length {expected}; "
+                    f"got {positions_4d.shape[1]}"
+                )
+
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond, positions_4d):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
@@ -355,11 +367,12 @@ class PI0Pytorch(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                positions_4d=positions_4d,
             )
             return suffix_out
 
         suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond, positions_4d
         )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
@@ -374,7 +387,7 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(self, device, observation, noise=None, num_steps=10, positions_4d=None) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -391,12 +404,21 @@ class PI0Pytorch(nn.Module):
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        # Split the 4D positions along the prefix/suffix boundary: the prefix pass builds
+        # the KV cache, each denoise step then supplies only its own suffix positions.
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_positions_4d = suffix_positions_4d = None
+        if positions_4d is not None:
+            prefix_positions_4d = positions_4d[:, :prefix_len]
+            suffix_positions_4d = positions_4d[:, prefix_len:]
+
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
+            positions_4d=prefix_positions_4d,
         )
 
         dt = -1.0 / num_steps
@@ -412,6 +434,7 @@ class PI0Pytorch(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
+                positions_4d=suffix_positions_4d,
             )
 
             # Euler step - use new tensor assignment instead of in-place operation
@@ -426,8 +449,13 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        positions_4d=None,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+
+        ``positions_4d``: optional (B, suffix_len, 4) positions for the suffix tokens only;
+        the prefix positions were already baked into ``past_key_values``.
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -454,6 +482,7 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
+            positions_4d=positions_4d,
         )
 
         suffix_out = outputs_embeds[1]

@@ -1,3 +1,4 @@
+import contextlib
 from typing import Literal
 
 import torch
@@ -6,6 +7,73 @@ from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
+
+
+class RotaryPositionEmbedding4D(nn.Module):
+    """4D Rotary Position Embedding over continuous (x, y, z, t) coordinates.
+
+    Ported from ArticuBot (diffusion_policy/model/flow_matching/helpers.py). Rather
+    than a single integer token index, every token carries a metric position: a 3D
+    point in the robot/world frame plus a normalized time. ``head_dim`` is split
+    across the four axes, each rotated by its own coordinate.
+
+    The channel layout differs from the ArticuBot version: axis blocks are laid out
+    in the first half of the vector and mirrored into the second half, so that
+    HuggingFace's ``rotate_half`` (which pairs channel i with i + head_dim/2) rotates
+    each pair under one shared angle. That makes the emitted cos/sin drop-in
+    compatible with ``modeling_gemma.apply_rotary_pos_emb``. It is the same
+    transform as the per-quarter formulation up to a permutation of channels.
+    """
+
+    def __init__(self, head_dim: int, base_frequency: float = 100.0):
+        super().__init__()
+        if head_dim % 8 != 0:
+            raise ValueError(f"head_dim must be divisible by 8 (4 axes x rotation pairs); got {head_dim}")
+        self.head_dim = head_dim
+        # Frequencies per axis within the half-vector.
+        self.axis_dim = head_dim // 8
+        inv_freq = 1.0 / (base_frequency ** (torch.arange(self.axis_dim, dtype=torch.float32) / self.axis_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Args: positions (B, L, 4) continuous coords. Returns cos, sin of (B, L, head_dim)."""
+        if positions.shape[-1] != 4:
+            raise ValueError(f"positions must have a trailing dim of 4 (x, y, z, t); got {tuple(positions.shape)}")
+        # (B, L, 4, 1) * (axis_dim,) -> (B, L, 4, axis_dim), flattened to the half-vector.
+        angles = positions.float().unsqueeze(-1) * self.inv_freq
+        half = angles.flatten(start_dim=-2)
+        emb = torch.cat([half, half], dim=-1)
+        return emb.cos(), emb.sin()
+
+
+class _Rope4DRotaryAdapter(nn.Module):
+    """Stands in for a HuggingFace ``rotary_emb`` so 4D positions reach its internal forward.
+
+    ``GemmaModel.forward`` computes ``self.rotary_emb(hidden_states, position_ids)``
+    and threads the result down to every layer. Swapping this in is the only seam
+    that reaches the KV-cached prefix/suffix paths without forking HF's forward.
+    The integer ``position_ids`` argument is ignored.
+    """
+
+    def __init__(self, rope_4d: RotaryPositionEmbedding4D, positions: torch.Tensor):
+        super().__init__()
+        self.rope_4d = rope_4d
+        self.positions = positions
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
+        cos, sin = self.rope_4d(self.positions)
+        return cos.to(x.dtype), sin.to(x.dtype)
+
+
+@contextlib.contextmanager
+def _swap_rotary(model, adapter):
+    """Temporarily replace ``model.rotary_emb``, restoring it on exit."""
+    original = model.rotary_emb
+    model.rotary_emb = adapter
+    try:
+        yield
+    finally:
+        model.rotary_emb = original
 
 
 class PaliGemmaWithExpertModel(nn.Module):
@@ -57,6 +125,16 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
+        # 4D RoPE is opt-in: it is used only on forward passes that are handed
+        # per-token (x, y, z, t) positions, so existing checkpoints and configs
+        # keep the stock 1D behaviour untouched.
+        if vlm_config.head_dim != action_expert_config.head_dim:
+            raise ValueError(
+                "VLM and action expert must share head_dim (their q/k are concatenated into one "
+                f"attention); got {vlm_config.head_dim} and {action_expert_config.head_dim}"
+            )
+        self.rope_4d = RotaryPositionEmbedding4D(vlm_config.head_dim)
+
         self.to_bfloat16_for_selected_params(precision)
 
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
@@ -95,30 +173,51 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        positions_4d: torch.Tensor | None = None,
     ):
+        """``positions_4d``: optional (B, L, 4) continuous (x, y, z, t) per-token positions.
+
+        When supplied, 4D RoPE replaces the stock 1D RoPE over ``position_ids``. L must
+        match the token sequence this call processes (prefix only, suffix only, or both).
+        When None, behaviour is unchanged.
+        """
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
-            prefix_output = self.paligemma.language_model.forward(
-                inputs_embeds=inputs_embeds[0],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+            lm = self.paligemma.language_model
+            ctx = (
+                _swap_rotary(lm, _Rope4DRotaryAdapter(self.rope_4d, positions_4d))
+                if positions_4d is not None
+                else contextlib.nullcontext()
             )
+            with ctx:
+                prefix_output = lm.forward(
+                    inputs_embeds=inputs_embeds[0],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                )
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            suffix_output = self.gemma_expert.model.forward(
-                inputs_embeds=inputs_embeds[1],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+            expert = self.gemma_expert.model
+            ctx = (
+                _swap_rotary(expert, _Rope4DRotaryAdapter(self.rope_4d, positions_4d))
+                if positions_4d is not None
+                else contextlib.nullcontext()
             )
+            with ctx:
+                suffix_output = expert.forward(
+                    inputs_embeds=inputs_embeds[1],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                )
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
@@ -154,7 +253,9 @@ class PaliGemmaWithExpertModel(nn.Module):
                 self._debug_gc_printed = True
 
             # Define the complete layer computation function for gradient checkpointing
-            def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
+            def compute_layer_complete(
+                layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, positions_4d
+            ):
                 models = [self.paligemma.language_model, self.gemma_expert.model]
 
                 query_states = []
@@ -188,7 +289,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                     device=query_states.device,
                     dtype=query_states.dtype,
                 )
-                cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
+                if positions_4d is not None:
+                    cos, sin = self.rope_4d(positions_4d)
+                    cos, sin = cos.to(dummy_tensor.dtype), sin.to(dummy_tensor.dtype)
+                else:
+                    cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
                 query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, unsqueeze_dim=1
                 )
@@ -246,12 +351,13 @@ class PaliGemmaWithExpertModel(nn.Module):
                         attention_mask,
                         position_ids,
                         adarms_cond,
+                        positions_4d,
                         use_reentrant=False,
                         preserve_rng_state=False,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
-                        layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
+                        layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, positions_4d
                     )
 
                 # Old code removed - now using compute_layer_complete function above
