@@ -138,11 +138,15 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # LEROBOT_VIDEO_BACKEND=pyav avoids torchcodec, which needs FFmpeg shared libraries that are
+    # not installed everywhere; None keeps LeRobot's own default.
+    video_backend = os.environ.get("LEROBOT_VIDEO_BACKEND") or None
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        video_backend=video_backend,
     )
 
     if data_config.prompt_from_task:
