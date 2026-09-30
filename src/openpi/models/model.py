@@ -106,6 +106,12 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # 4D RoPE inputs (PyTorch pi0 with rope_4d). patch_xyz: the 3D point (robot base frame,
+    # metres) behind each image token, one (p, 3) grid per image in `images` order; eef_xyz: the
+    # gripper position, used for the language and action tokens.
+    patch_xyz: at.Float[ArrayT, "*b n p 3"] | None = None
+    eef_xyz: at.Float[ArrayT, "*b 3"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +132,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            patch_xyz=data.get("patch_xyz"),
+            eef_xyz=data.get("eef_xyz"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

@@ -10,6 +10,7 @@ import dataclasses
 import numpy as np
 
 from openpi import transforms
+from openpi.policies import droid_policy
 
 JOINTS = slice(10, 17)
 GRIPPER = slice(9, 10)
@@ -104,3 +105,35 @@ class DroidEEFOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         return {"actions": np.asarray(data["actions"][..., :10])}
 
+
+# ---------------------------------------------------------------------------
+# 4D RoPE inputs (PyTorch pi0 with rope_4d). The converter stores, per frame and camera, the 3D
+# point (robot base frame, metres) behind each 14x14 patch of the 224x224 model image
+# ("observation.patch_xyz.<camera>", (256, 3)); the eval client sends the same grids live.
+# ---------------------------------------------------------------------------
+EEF_XYZ = slice(0, 3)
+
+
+@dataclasses.dataclass(frozen=True)
+class MolmoSpacesToDroidRope4D(transforms.DataTransformFn):
+    """MolmoSpacesToDroid plus the patch point grids and the gripper position."""
+
+    def __call__(self, data: dict) -> dict:
+        out = MolmoSpacesToDroid()(data)
+        out["observation/patch_xyz_exterior"] = data["observation.patch_xyz.exterior_1_left"]
+        out["observation/patch_xyz_wrist"] = data["observation.patch_xyz.wrist_left"]
+        out["observation/eef_xyz"] = np.asarray(data["observation.state"])[..., EEF_XYZ]
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
+class DroidRope4DInputs(droid_policy.DroidInputs):
+    """DroidInputs plus Observation.patch_xyz (base, left wrist, masked right wrist) and eef_xyz."""
+
+    def __call__(self, data: dict) -> dict:
+        inputs = super().__call__(data)
+        exterior = np.asarray(data["observation/patch_xyz_exterior"], dtype=np.float32).reshape(-1, 3)
+        wrist = np.asarray(data["observation/patch_xyz_wrist"], dtype=np.float32).reshape(-1, 3)
+        inputs["patch_xyz"] = np.stack([exterior, wrist, np.zeros_like(exterior)])
+        inputs["eef_xyz"] = np.asarray(data["observation/eef_xyz"], dtype=np.float32).reshape(3)
+        return inputs

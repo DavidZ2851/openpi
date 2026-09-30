@@ -528,6 +528,29 @@ class LeRobotMolmoSpacesDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotMolmoSpacesRope4DDataConfig(LeRobotMolmoSpacesDataConfig):
+    """LeRobotMolmoSpacesDataConfig plus the 4D RoPE inputs (patch point grids + gripper position).
+
+    Needs datasets converted with --patch-xyz (mlspaces_multiview_to_lerobot.py) and a model with
+    rope_4d=True (PyTorch training).
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        config = super().create(assets_dirs, model_config)
+        droid_inputs, *rest = config.data_transforms.inputs
+        assert isinstance(droid_inputs, droid_policy.DroidInputs)
+        return dataclasses.replace(
+            config,
+            repack_transforms=_transforms.Group(inputs=[molmospaces_policy.MolmoSpacesToDroidRope4D()]),
+            data_transforms=dataclasses.replace(
+                config.data_transforms,
+                inputs=[molmospaces_policy.DroidRope4DInputs(model_type=model_config.model_type), *rest],
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -1046,6 +1069,27 @@ _CONFIGS = [
             assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
+        num_train_steps=10_000,
+        batch_size=32,
+        save_interval=2_000,
+    ),
+    # Full fine-tune of pi05_droid_jointpos with 4D RoPE (PyTorch only: scripts/train_pytorch.py).
+    # Every token is rotated by a continuous (x, y, z, t) position instead of its sequence index:
+    # image tokens by the 3D point behind their patch, language/action tokens by the gripper
+    # position (see PI0Pytorch.build_positions_4d). Needs datasets converted with --patch-xyz and
+    # the PyTorch weights of pi05_droid_jointpos (examples/convert_jax_model_to_pytorch.py) in
+    # $PI05_JOINTPOS_PYTORCH_DIR.
+    TrainConfig(
+        name="pi05_droid_jointpos_molmospaces_rope4d_full",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=15, rope_4d=True, pytorch_compile_mode=None),
+        data=LeRobotMolmoSpacesRope4DDataConfig(
+            repo_id="local/pick_kettle_multiview",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
+        ),
+        pytorch_weight_path=os.environ.get(
+            "PI05_JOINTPOS_PYTORCH_DIR", f"{PI05_JOINTPOS_DIR}_pytorch"
+        ),
         num_train_steps=10_000,
         batch_size=32,
         save_interval=2_000,

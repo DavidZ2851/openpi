@@ -34,6 +34,12 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # 4D RoPE (PyTorch model only): rotate every token by a continuous (x, y, z, t) position
+    # instead of its 1D sequence index. Needs Observation.patch_xyz and Observation.eef_xyz.
+    rope_4d: bool = False
+    # Metres -> RoPE position units (centimetres, as in ArticuBot).
+    rope_4d_xyz_scale: float = 100.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

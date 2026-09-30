@@ -23,10 +23,13 @@ def preprocess_observation_pytorch(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    geometric_aug: bool = True,
 ):
     """Torch.compile-compatible version of preprocess_observation_pytorch with simplified type annotations.
 
     This function avoids complex type annotations that can cause torch.compile issues.
+    ``geometric_aug=False`` skips the random crop/rotation, which would move image content
+    away from the 3D points fixed to each patch for 4D RoPE.
     """
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
@@ -54,7 +57,7 @@ def preprocess_observation_pytorch(
             image = image / 2.0 + 0.5
 
             # Apply PyTorch-based augmentations
-            if "wrist" not in key:
+            if geometric_aug and "wrist" not in key:
                 # Geometric augmentations for non-wrist cameras
                 height, width = image.shape[1:3]
 
@@ -170,4 +173,6 @@ def preprocess_observation_pytorch(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        patch_xyz=getattr(observation, "patch_xyz", None),
+        eef_xyz=getattr(observation, "eef_xyz", None),
     )

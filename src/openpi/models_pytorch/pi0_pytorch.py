@@ -161,7 +161,9 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        observation = _preprocessing.preprocess_observation_pytorch(
+            observation, train=train, geometric_aug=not self.config.rope_4d
+        )
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
@@ -169,6 +171,30 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt_mask,
             observation.state,
         )
+
+    def build_positions_4d(self, observation, num_image_tokens: int, num_lang_tokens: int) -> Tensor:
+        """(B, L, 4) 4D RoPE positions for the prefix+suffix sequence, laid out as ArticuBot's.
+
+        Image tokens sit at their patch's 3D point (``observation.patch_xyz``) with t = 0.
+        Language tokens (prompt + discretized state) and action tokens sit at the gripper
+        (``observation.eef_xyz``); t carries their order (1..L for language, then L+1..L+H for
+        actions), so token order is kept. xyz is in rope_4d_xyz_scale units (cm by default).
+        """
+        patch = observation.patch_xyz.to(torch.float32)  # (B, n_img, P, 3)
+        eef = observation.eef_xyz.to(torch.float32)  # (B, 3)
+        bsize, n_img, n_patch, _ = patch.shape
+        if n_img * n_patch != num_image_tokens:
+            raise ValueError(f"patch_xyz covers {n_img}x{n_patch} image tokens, the prefix has {num_image_tokens}")
+        scale = self.config.rope_4d_xyz_scale
+        device = patch.device
+        img = torch.cat([patch.reshape(bsize, -1, 3) * scale, patch.new_zeros(bsize, num_image_tokens, 1)], dim=-1)
+        num_other = num_lang_tokens + self.config.action_horizon
+        t = torch.arange(1, num_other + 1, device=device, dtype=torch.float32)
+        other = torch.cat(
+            [(eef * scale)[:, None, :].expand(bsize, num_other, 3), t[None, :, None].expand(bsize, num_other, 1)],
+            dim=-1,
+        )
+        return torch.cat([img, other], dim=1)
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -334,6 +360,10 @@ class PI0Pytorch(nn.Module):
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        if positions_4d is None and self.config.rope_4d:
+            positions_4d = self.build_positions_4d(
+                observation, prefix_embs.shape[1] - lang_tokens.shape[1], lang_tokens.shape[1]
+            ).to(prefix_embs.device)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -397,6 +427,10 @@ class PI0Pytorch(nn.Module):
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        if positions_4d is None and self.config.rope_4d:
+            positions_4d = self.build_positions_4d(
+                observation, prefix_embs.shape[1] - lang_tokens.shape[1], lang_tokens.shape[1]
+            ).to(prefix_embs.device)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
