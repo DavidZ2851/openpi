@@ -471,6 +471,34 @@ PI05_JOINTPOS_DIR = os.environ.get(
 )
 
 
+# Original pi05_droid checkpoint (joint-velocity model), the starting point for the EEF fine-tunes.
+PI05_DROID_DIR = os.environ.get("PI05_DROID_DIR", "gs://openpi-assets/checkpoints/pi05_droid")
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotMolmoSpacesEEFDataConfig(DataConfigFactory):
+    """MolmoSpaces multi-view LeRobot datasets with an end-effector action space.
+
+    Actions are the dataset's eef_9d (robot base frame) + gripper, each action of a chunk expressed
+    relative to the EEF pose at the chunk's start (see molmospaces_policy.MolmoSpacesToDroidEEF).
+    Norm stats are this dataset's own (run scripts/compute_norm_stats.py for each repo id).
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(inputs=[molmospaces_policy.MolmoSpacesToDroidEEF()])
+        data_transforms = _transforms.Group(
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            outputs=[molmospaces_policy.DroidEEFOutputs()],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotMolmoSpacesDataConfig(DataConfigFactory):
     """MolmoSpaces multi-view LeRobot datasets (see mlspaces_multiview_to_lerobot.py).
@@ -995,6 +1023,33 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             f"{PI05_JOINTPOS_DIR}/params"
         ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,  # LoRA fine-tuning does not use EMA
+        num_train_steps=20_000,
+        batch_size=8,
+        save_interval=2_000,
+    ),
+    # LoRA fine-tune of the original pi05_droid on a MolmoSpaces dataset, with an end-effector
+    # action space (chunk-relative eef_9d deltas in the robot base frame + absolute gripper).
+    # Compute norm stats first: scripts/compute_norm_stats.py --config-name pi05_droid_molmospaces_eef_lora
+    TrainConfig(
+        name="pi05_droid_molmospaces_eef_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotMolmoSpacesEEFDataConfig(
+            repo_id="local/pick_kettle_multiview",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_DROID_DIR}/params"),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=15,
