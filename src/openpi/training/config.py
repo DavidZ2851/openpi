@@ -1034,6 +1034,22 @@ _CONFIGS = [
         batch_size=8,
         save_interval=2_000,
     ),
+    # Full fine-tune of pi05_droid_jointpos on a MolmoSpaces multi-view dataset: same data, norm
+    # stats and action space as pi05_droid_jointpos_molmospaces_lora, but all weights train (with EMA).
+    # Needs a >70 GB GPU, or --fsdp-devices N over N GPUs.
+    TrainConfig(
+        name="pi05_droid_jointpos_molmospaces_full",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=15),
+        data=LeRobotMolmoSpacesDataConfig(
+            repo_id="local/pick_kettle_multiview",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
+        num_train_steps=10_000,
+        batch_size=32,
+        save_interval=2_000,
+    ),
     # LoRA fine-tune of the original pi05_droid on a MolmoSpaces dataset, with an end-effector
     # action space (chunk-relative eef_9d deltas in the robot base frame + absolute gripper).
     # Compute norm stats first: scripts/compute_norm_stats.py --config-name pi05_droid_molmospaces_eef_lora
