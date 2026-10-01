@@ -24,6 +24,7 @@ Multi-Node Training:
 """
 
 import dataclasses
+import datetime
 import gc
 import logging
 import os
@@ -96,7 +97,11 @@ def setup_ddp():
     use_ddp = world_size > 1
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+        # Only rank 0 writes checkpoints (~20 GB for a full fine-tune), while the other ranks wait in
+        # the next collective; on a slow shared disk that can exceed NCCL's default 10 min timeout and
+        # the watchdog aborts every rank (SIGABRT). OPENPI_DDP_TIMEOUT_MIN raises it (default 60).
+        timeout = datetime.timedelta(minutes=float(os.environ.get("OPENPI_DDP_TIMEOUT_MIN", "60")))
+        torch.distributed.init_process_group(backend=backend, init_method="env://", timeout=timeout)
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
@@ -146,13 +151,17 @@ def get_model_parameters(model):
     )
 
 
+def is_save_step(global_step, config) -> bool:
+    return (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
 
     # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+    if is_save_step(global_step, config):
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -603,6 +612,9 @@ def train_loop(config: _config.TrainConfig):
             global_step += 1
             # Save checkpoint using the new mechanism
             save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            if use_ddp and is_save_step(global_step, config):
+                # Keep the other ranks here until rank 0 has finished writing.
+                dist.barrier()
 
             # Update progress bar
             if pbar is not None:
