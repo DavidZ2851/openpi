@@ -1058,8 +1058,8 @@ _CONFIGS = [
         save_interval=2_000,
     ),
     # Full fine-tune of pi05_droid_jointpos on a MolmoSpaces multi-view dataset: same data, norm
-    # stats and action space as pi05_droid_jointpos_molmospaces_lora, but all weights train (with EMA).
-    # Needs a >70 GB GPU, or --fsdp-devices N over N GPUs.
+    # stats, action space, batch size and steps as pi05_droid_jointpos_molmospaces_lora, but all
+    # weights train (with EMA). Needs a >70 GB GPU, or --fsdp-devices N over N GPUs.
     TrainConfig(
         name="pi05_droid_jointpos_molmospaces_full",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=15),
@@ -1069,8 +1069,9 @@ _CONFIGS = [
             assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
-        num_train_steps=10_000,
-        batch_size=32,
+        # Same batch size and steps as pi05_droid_jointpos_molmospaces_lora (like-for-like).
+        num_train_steps=20_000,
+        batch_size=8,
         save_interval=2_000,
     ),
     # Full fine-tune of pi05_droid_jointpos with 4D RoPE (PyTorch only: scripts/train_pytorch.py).
@@ -1090,8 +1091,9 @@ _CONFIGS = [
         pytorch_weight_path=os.environ.get(
             "PI05_JOINTPOS_PYTORCH_DIR", f"{PI05_JOINTPOS_DIR}_pytorch"
         ),
-        num_train_steps=10_000,
-        batch_size=32,
+        # Same batch size and steps as pi05_droid_jointpos_molmospaces_lora (like-for-like).
+        num_train_steps=20_000,
+        batch_size=8,
         save_interval=2_000,
     ),
     # LoRA fine-tune of the original pi05_droid on a MolmoSpaces dataset, with an end-effector
