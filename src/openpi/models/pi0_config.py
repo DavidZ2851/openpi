@@ -40,6 +40,13 @@ class Pi0Config(_model.BaseModelConfig):
     # Metres -> RoPE position units (centimetres, as in ArticuBot).
     rope_4d_xyz_scale: float = 100.0
 
+    # Conditional LoRA (LoRAdapter): FiLM the low-rank bottleneck of every LoRA layer (needs *_lora
+    # Gemma variants) with a per-sample condition from a geometry encoder (models/cond_encoders.py):
+    # "depth" (Observation.depth, DepthEncoder) or "pointnet" (Observation.point_cloud,
+    # PointNet2Encoder). None = plain LoRA.
+    cond_lora: str | None = None
+    cond_lora_dim: int = 256
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

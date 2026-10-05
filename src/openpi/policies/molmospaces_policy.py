@@ -137,3 +137,42 @@ class DroidRope4DInputs(droid_policy.DroidInputs):
         inputs["patch_xyz"] = np.stack([exterior, wrist, np.zeros_like(exterior)])
         inputs["eef_xyz"] = np.asarray(data["observation/eef_xyz"], dtype=np.float32).reshape(3)
         return inputs
+
+
+# ---------------------------------------------------------------------------
+# Conditional LoRA inputs (PyTorch pi0 with cond_lora). The converter (--depth-maps, --point-cloud)
+# stores per frame the exterior and wrist depth maps ("observation.depth.<camera>", flattened
+# DEPTH_SIZE^2, metres, 0 = invalid) and the fused point cloud ("observation.point_cloud",
+# flattened (1024, 3), robot base frame); the eval client sends the same, built by
+# molmospaces' molmo_spaces/utils/cond_inputs.py and dp3_pointcloud.py.
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class MolmoSpacesToDroidCond(transforms.DataTransformFn):
+    """MolmoSpacesToDroid plus whichever condition inputs the dataset has."""
+
+    def __call__(self, data: dict) -> dict:
+        out = MolmoSpacesToDroid()(data)
+        if "observation.depth.exterior_1_left" in data:
+            out["observation/depth_exterior"] = data["observation.depth.exterior_1_left"]
+            out["observation/depth_wrist"] = data["observation.depth.wrist_left"]
+        if "observation.point_cloud" in data:
+            out["observation/point_cloud"] = data["observation.point_cloud"]
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
+class DroidCondInputs(droid_policy.DroidInputs):
+    """DroidInputs plus Observation.depth ([exterior, wrist], square maps) and .point_cloud (N, 3)."""
+
+    def __call__(self, data: dict) -> dict:
+        inputs = super().__call__(data)
+        if "observation/depth_exterior" in data:
+            maps = [
+                np.asarray(data[k], dtype=np.float32).reshape(-1)
+                for k in ("observation/depth_exterior", "observation/depth_wrist")
+            ]
+            side = int(round(np.sqrt(maps[0].size)))
+            inputs["depth"] = np.stack([m.reshape(side, side) for m in maps])
+        if "observation/point_cloud" in data:
+            inputs["point_cloud"] = np.asarray(data["observation/point_cloud"], dtype=np.float32).reshape(-1, 3)
+        return inputs

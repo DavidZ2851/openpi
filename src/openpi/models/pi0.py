@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 
 import einops
@@ -7,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import cond_encoders as _cond_encoders
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
@@ -69,6 +71,26 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        self.cond_lora = config.cond_lora
+        if config.cond_lora is not None:
+            # conditional LoRA: give every LoRA layer FiLM params for a cond_lora_dim condition
+            if not (paligemma_config.lora_configs or action_expert_config.lora_configs):
+                raise ValueError("cond_lora needs LoRA Gemma variants (e.g. gemma_2b_lora)")
+            paligemma_config, action_expert_config = (
+                dataclasses.replace(
+                    c,
+                    lora_configs={k: dataclasses.replace(v, cond_dim=config.cond_lora_dim) for k, v in c.lora_configs.items()},
+                )
+                for c in (paligemma_config, action_expert_config)
+            )
+            # "lora" in the name: the LoRA freeze filter keeps it trainable and the weight loader
+            # initialises it (the base checkpoint has no such params).
+            if config.cond_lora == "depth":
+                self.lora_cond_encoder = _cond_encoders.DepthEncoder(config.cond_lora_dim, rngs)
+            elif config.cond_lora == "pointnet":
+                self.lora_cond_encoder = _cond_encoders.PointNet2Encoder(config.cond_lora_dim, rngs)
+            else:
+                raise ValueError(f"cond_lora must be 'depth' or 'pointnet', got {config.cond_lora!r}")
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
@@ -185,12 +207,22 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    def _lora_cond(self, obs: _model.Observation) -> at.Float[at.Array, "b c"] | None:
+        """The conditional-LoRA condition of this batch (None without cond_lora)."""
+        if self.cond_lora is None:
+            return None
+        inputs = obs.depth if self.cond_lora == "depth" else obs.point_cloud
+        if inputs is None:
+            raise ValueError(f"cond_lora={self.cond_lora!r} needs Observation.{'depth' if self.cond_lora == 'depth' else 'point_cloud'}")
+        return self.lora_cond_encoder(inputs)
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        lora_cond = self._lora_cond(observation)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -207,7 +239,11 @@ class Pi0(_model.BaseModel):
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
+            lora_cond=lora_cond,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
@@ -223,6 +259,7 @@ class Pi0(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
+        lora_cond = self._lora_cond(observation)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
@@ -234,7 +271,9 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        _, kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions, lora_cond=lora_cond
+        )
 
         def step(carry):
             x_t, time = carry
@@ -264,6 +303,7 @@ class Pi0(_model.BaseModel):
                 positions=positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
+                lora_cond=lora_cond,
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])

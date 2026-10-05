@@ -551,6 +551,29 @@ class LeRobotMolmoSpacesRope4DDataConfig(LeRobotMolmoSpacesDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotMolmoSpacesCondDataConfig(LeRobotMolmoSpacesDataConfig):
+    """LeRobotMolmoSpacesDataConfig plus the conditional-LoRA inputs (depth maps / point cloud).
+
+    Needs datasets converted with --depth-maps and/or --point-cloud (mlspaces_multiview_to_lerobot.py)
+    and a model with cond_lora set (PyTorch training).
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        config = super().create(assets_dirs, model_config)
+        droid_inputs, *rest = config.data_transforms.inputs
+        assert isinstance(droid_inputs, droid_policy.DroidInputs)
+        return dataclasses.replace(
+            config,
+            repack_transforms=_transforms.Group(inputs=[molmospaces_policy.MolmoSpacesToDroidCond()]),
+            data_transforms=dataclasses.replace(
+                config.data_transforms,
+                inputs=[molmospaces_policy.DroidCondInputs(model_type=model_config.model_type), *rest],
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -1092,6 +1115,64 @@ _CONFIGS = [
             "PI05_JOINTPOS_PYTORCH_DIR", f"{PI05_JOINTPOS_DIR}_pytorch"
         ),
         # Same batch size and steps as pi05_droid_jointpos_molmospaces_lora (like-for-like).
+        num_train_steps=20_000,
+        batch_size=8,
+        save_interval=2_000,
+    ),
+    # Conditional LoRA (LoRAdapter) of pi05_droid_jointpos: pi05_droid_jointpos_molmospaces_lora with
+    # every LoRA bottleneck FiLM-modulated by a condition from the exterior + wrist depth maps (DepthEncoder).
+    # Needs a dataset converted with --depth-maps --point-cloud <task> (mlspaces_multiview_to_lerobot.py).
+    TrainConfig(
+        name="pi05_droid_jointpos_molmospaces_condlora_depth",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            cond_lora="depth",
+        ),
+        data=LeRobotMolmoSpacesCondDataConfig(
+            repo_id="local/pick_place_potato_onehouse_clean_random_cond",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,  # as the LoRA config
+        num_train_steps=20_000,
+        batch_size=8,
+        save_interval=2_000,
+    ),
+    # Conditional LoRA (LoRAdapter) of pi05_droid_jointpos: pi05_droid_jointpos_molmospaces_lora with
+    # every LoRA bottleneck FiLM-modulated by a condition from the fused exterior + wrist point cloud (PointNet++).
+    # Needs a dataset converted with --depth-maps --point-cloud <task> (mlspaces_multiview_to_lerobot.py).
+    TrainConfig(
+        name="pi05_droid_jointpos_molmospaces_condlora_pointnet",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            cond_lora="pointnet",
+        ),
+        data=LeRobotMolmoSpacesCondDataConfig(
+            repo_id="local/pick_place_potato_onehouse_clean_random_cond",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,  # as the LoRA config
         num_train_steps=20_000,
         batch_size=8,
         save_interval=2_000,

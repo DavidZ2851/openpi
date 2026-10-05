@@ -112,6 +112,11 @@ class Observation(Generic[ArrayT]):
     patch_xyz: at.Float[ArrayT, "*b n p 3"] | None = None
     eef_xyz: at.Float[ArrayT, "*b 3"] | None = None
 
+    # Conditional LoRA inputs (PyTorch pi0 with cond_lora): metric depth maps of the exterior and
+    # wrist cameras (0 = invalid) and the fused point cloud in the robot base frame (metres).
+    depth: at.Float[ArrayT, "*b ncam dh dw"] | None = None
+    point_cloud: at.Float[ArrayT, "*b npts 3"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -134,6 +139,8 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             patch_xyz=data.get("patch_xyz"),
             eef_xyz=data.get("eef_xyz"),
+            depth=data.get("depth"),
+            point_cloud=data.get("point_cloud"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -213,6 +220,10 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        patch_xyz=observation.patch_xyz,
+        eef_xyz=observation.eef_xyz,
+        depth=observation.depth,
+        point_cloud=observation.point_cloud,
     )
 
 

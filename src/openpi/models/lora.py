@@ -24,6 +24,11 @@ class LoRAConfig:
     axes: tuple[int, int] = (-2, -1)
     # Axis label which is used by LoRA in einsum equations. Must not be present in the original equation.
     label: str = "L"
+    # Conditional LoRA (LoRAdapter, Stracke et al. 2024): if set, the rank-r bottleneck A x is
+    # FiLM-modulated by a per-sample condition c of this size, (1 + gamma(c)) * A x + beta(c), with
+    # gamma/beta bias-free linear maps c -> r ("lora_film_*" params, so the LoRA freeze filter and
+    # weight loader treat them like the other LoRA params). The condition is passed at call time.
+    cond_dim: int | None = None
 
     @property
     def scaling_value(self) -> float:
@@ -50,15 +55,24 @@ class Einsum(nn.Module):
             shape_b[config.axes[0]] = config.rank
             self.w_a = self.param("lora_a", config.init_fn, shape_a)
             self.w_b = self.param("lora_b", config.init_fn, shape_b)
+            if config.cond_dim:
+                self.film = _film_params(self, config.cond_dim, config.rank)
 
     @nn.compact
-    def __call__(self, eqn: str, x):
+    def __call__(self, eqn: str, x, cond=None):
         dtype = x.dtype  # original dtype, could be half-precision
         result = jnp.einsum(eqn, x, self.w.astype(dtype))
 
         if config := self.lora_config:
             eqn_a, eqn_b = self._make_lora_eqns(eqn)
             lora = jnp.einsum(eqn_a, x, self.w_a.astype(dtype))
+            if config.cond_dim and cond is not None:
+                # broadcast the per-sample (B, r) FiLM over every other axis of A x
+                a_out = eqn_a.split("->")[1]
+                shape = [1] * len(a_out)
+                shape[a_out.index("B")] = cond.shape[0]
+                shape[a_out.index(config.label)] = config.rank
+                lora = _apply_film(lora, cond, self.film, shape)
             lora = jnp.einsum(eqn_b, lora, self.w_b.astype(dtype))
             result = result + lora * config.scaling_value
 
@@ -119,14 +133,24 @@ class FeedForward(nn.Module):
                 self.param("linear_lora_a", self.lora_config.init_fn, (self.hidden_dim, self.lora_config.rank)),
                 self.param("linear_lora_b", self.lora_config.init_fn, (self.lora_config.rank, self.features)),
             )
+        self.film_gating = self.film_linear = None
+        if self.lora_config and self.lora_config.cond_dim:
+            c, r = self.lora_config.cond_dim, self.lora_config.rank
+            self.film_gating = (
+                _film_params(self, c, r, "lora_film_gating_0"),
+                _film_params(self, c, r, "lora_film_gating_1"),
+            )
+            self.film_linear = _film_params(self, c, r, "lora_film_linear")
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, cond=None):
         dtype = x.dtype  # original dtype, could be half-precision
+        use_film = self.film_gating is not None and cond is not None
         ff_gate = self._dot(
             x,
             self.w_gating[0],
             None if self.w_gating_lora is None else (self.w_gating_lora[0][0], self.w_gating_lora[1][0]),
+            (cond, self.film_gating[0]) if use_film else None,
         )
         gate_value = nn.gelu(ff_gate)
 
@@ -134,15 +158,38 @@ class FeedForward(nn.Module):
             x,
             self.w_gating[1],
             None if self.w_gating_lora is None else (self.w_gating_lora[0][1], self.w_gating_lora[1][1]),
+            (cond, self.film_gating[1]) if use_film else None,
         )
         activations = gate_value * ff1
 
-        outputs = self._dot(activations, self.w_linear, self.w_linear_lora)
+        outputs = self._dot(
+            activations, self.w_linear, self.w_linear_lora, (cond, self.film_linear) if use_film else None
+        )
         assert outputs.dtype == dtype
         return outputs
 
-    def _dot(self, x: at.Array, w: at.Array, lora_weights: tuple[at.Array, at.Array] | None) -> at.Array:
+    def _dot(self, x: at.Array, w: at.Array, lora_weights: tuple[at.Array, at.Array] | None, film=None) -> at.Array:
         base = jnp.dot(x, w.astype(x.dtype))
         if lora_weights is None:
             return base
-        return base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
+        a = jnp.dot(x, lora_weights[0].astype(x.dtype))
+        if film is not None:
+            cond, params = film
+            shape = (cond.shape[0],) + (1,) * (a.ndim - 2) + (a.shape[-1],)
+            a = _apply_film(a, cond, params, shape)
+        return base + jnp.dot(a, lora_weights[1].astype(x.dtype))
+
+
+def _film_params(module: nn.Module, cond_dim: int, rank: int, prefix: str = "lora_film"):
+    """(gamma, beta) weights (cond_dim, rank), initialised like LoRAdapter's nn.Linear (U(+-1/sqrt(c)))."""
+    init = nn.initializers.variance_scaling(1 / 3, "fan_in", "uniform")
+    return (module.param(f"{prefix}_gamma", init, (cond_dim, rank)), module.param(f"{prefix}_beta", init, (cond_dim, rank)))
+
+
+def _apply_film(a: at.Array, cond: at.Array, params, shape) -> at.Array:
+    """(1 + gamma(c)) * a + beta(c), with the (B, r) FiLM reshaped to broadcast against a."""
+    gamma_w, beta_w = params
+    cond = cond.astype(a.dtype)
+    gamma = jnp.dot(cond, gamma_w.astype(a.dtype)).reshape(shape)
+    beta = jnp.dot(cond, beta_w.astype(a.dtype)).reshape(shape)
+    return a * (1 + gamma) + beta
