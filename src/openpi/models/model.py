@@ -112,10 +112,12 @@ class Observation(Generic[ArrayT]):
     patch_xyz: at.Float[ArrayT, "*b n p 3"] | None = None
     eef_xyz: at.Float[ArrayT, "*b 3"] | None = None
 
-    # Conditional LoRA inputs (PyTorch pi0 with cond_lora): metric depth maps of the exterior and
-    # wrist cameras (0 = invalid) and the fused point cloud in the robot base frame (metres).
+    # Conditional LoRA inputs (pi0 with cond_lora): metric depth map(s) (0 = invalid), the fused
+    # point cloud in the robot base frame (metres), and the exterior camera's Plücker ray map
+    # (direction, moment; robot base frame).
     depth: at.Float[ArrayT, "*b ncam dh dw"] | None = None
     point_cloud: at.Float[ArrayT, "*b npts 3"] | None = None
+    plucker: at.Float[ArrayT, "*b 6 ph pw"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -141,6 +143,7 @@ class Observation(Generic[ArrayT]):
             eef_xyz=data.get("eef_xyz"),
             depth=data.get("depth"),
             point_cloud=data.get("point_cloud"),
+            plucker=data.get("plucker"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -224,6 +227,7 @@ def preprocess_observation(
         eef_xyz=observation.eef_xyz,
         depth=observation.depth,
         point_cloud=observation.point_cloud,
+        plucker=observation.plucker,
     )
 
 

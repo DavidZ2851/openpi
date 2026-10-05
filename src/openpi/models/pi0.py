@@ -85,12 +85,14 @@ class Pi0(_model.BaseModel):
             )
             # "lora" in the name: the LoRA freeze filter keeps it trainable and the weight loader
             # initialises it (the base checkpoint has no such params).
-            if config.cond_lora == "depth":
-                self.lora_cond_encoder = _cond_encoders.DepthEncoder(config.cond_lora_dim, rngs)
-            elif config.cond_lora == "pointnet":
-                self.lora_cond_encoder = _cond_encoders.PointNet2Encoder(config.cond_lora_dim, rngs)
-            else:
-                raise ValueError(f"cond_lora must be 'depth' or 'pointnet', got {config.cond_lora!r}")
+            encoders = {
+                "depth": _cond_encoders.DepthEncoder,
+                "pointnet": _cond_encoders.PointNet2Encoder,
+                "plucker": _cond_encoders.PluckerEncoder,
+            }
+            if config.cond_lora not in encoders:
+                raise ValueError(f"cond_lora must be one of {sorted(encoders)}, got {config.cond_lora!r}")
+            self.lora_cond_encoder = encoders[config.cond_lora](config.cond_lora_dim, rngs)
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
@@ -211,9 +213,10 @@ class Pi0(_model.BaseModel):
         """The conditional-LoRA condition of this batch (None without cond_lora)."""
         if self.cond_lora is None:
             return None
-        inputs = obs.depth if self.cond_lora == "depth" else obs.point_cloud
+        field = {"depth": "depth", "pointnet": "point_cloud", "plucker": "plucker"}[self.cond_lora]
+        inputs = getattr(obs, field)
         if inputs is None:
-            raise ValueError(f"cond_lora={self.cond_lora!r} needs Observation.{'depth' if self.cond_lora == 'depth' else 'point_cloud'}")
+            raise ValueError(f"cond_lora={self.cond_lora!r} needs Observation.{field}")
         return self.lora_cond_encoder(inputs)
 
     @override

@@ -1,9 +1,12 @@
 """Condition encoders for conditional LoRA (lora.LoRAConfig.cond_dim): observation -> (B, cond_dim).
 
-- DepthEncoder: metric depth maps of the exterior and wrist cameras (B, n_cams, H, W), 0 = invalid.
-  Per camera [depth / max_depth, valid mask] through a conv stack shaped like LoRAdapter's structure
-  mapper (3x3 convs, SiLU, four stride-2 stages), global average pooling; the per-camera vectors
-  (shared weights) are concatenated, projected and LayerNorm'd (LoRAdapter's SimpleMapper).
+- DepthEncoder: metric depth map(s) (B, n_cams, H, W), 0 = invalid; per camera [depth / max_depth,
+  valid mask] through a ConvMapEncoder.
+- PluckerEncoder: the exterior camera's Plücker ray map (B, 6, H, W) in the robot base frame
+  (direction, moment) through a ConvMapEncoder.
+- ConvMapEncoder: a conv stack shaped like LoRAdapter's structure mapper (3x3 convs, SiLU, four
+  stride-2 stages), global average pooling; the per-map vectors (shared weights) are concatenated,
+  projected and LayerNorm'd (LoRAdapter's SimpleMapper).
 - PointNet2Encoder: PointNet++ with single-scale grouping on the fused point cloud (B, N, 3) in the
   robot base frame, normalised with a fixed workspace centre/scale: two set-abstraction levels
   (farthest point sampling + ball query + shared MLP + max pool) and a global one.
@@ -16,26 +19,44 @@ import jax.numpy as jnp
 import openpi.shared.array_typing as at
 
 
-class DepthEncoder(nnx.Module):
-    def __init__(self, cond_dim: int, rngs: nnx.Rngs, n_cams: int = 2, max_depth: float = 4.0, width: int = 128):
-        self.max_depth = max_depth
-        chans = [(2, 16, 1), (16, 16, 1), (16, 32, 2), (32, 32, 1), (32, 64, 2), (64, 64, 1),
+class ConvMapEncoder(nnx.Module):
+    """(B, n_maps, H, W, in_channels) -> (B, cond_dim)."""
+
+    def __init__(self, cond_dim: int, rngs: nnx.Rngs, in_channels: int, n_maps: int = 1, width: int = 128):
+        chans = [(in_channels, 16, 1), (16, 16, 1), (16, 32, 2), (32, 32, 1), (32, 64, 2), (64, 64, 1),
                  (64, width, 2), (width, width, 1), (width, width, 2), (width, width, 1)]  # fmt: skip
         # named attributes, not a list: openpi flattens param paths with string keys
         self.n_convs = len(chans)
         for i, (cin, cout, s) in enumerate(chans):
             setattr(self, f"conv{i}", nnx.Conv(cin, cout, (3, 3), strides=(s, s), padding="SAME", rngs=rngs))
-        self.proj = nnx.Linear(n_cams * width, cond_dim, rngs=rngs)
+        self.proj = nnx.Linear(n_maps * width, cond_dim, rngs=rngs)
         self.norm = nnx.LayerNorm(cond_dim, rngs=rngs)
 
-    def __call__(self, depth: at.Float[at.Array, "b n h w"]) -> at.Float[at.Array, "b c"]:
-        b, n, h, w = depth.shape
-        d = depth.reshape(b * n, h, w, 1).astype(jnp.float32)
-        x = jnp.concatenate([d / self.max_depth, (d > 0).astype(jnp.float32)], axis=-1)
+    def __call__(self, maps: at.Float[at.Array, "b n h w c"]) -> at.Float[at.Array, "b d"]:
+        b, n, h, w, c = maps.shape
+        x = maps.reshape(b * n, h, w, c).astype(jnp.float32)
         for i in range(self.n_convs):
             x = nnx.silu(getattr(self, f"conv{i}")(x))
         feats = x.mean(axis=(1, 2)).reshape(b, -1)
         return self.norm(self.proj(feats))
+
+
+class DepthEncoder(nnx.Module):
+    def __init__(self, cond_dim: int, rngs: nnx.Rngs, n_cams: int = 1, max_depth: float = 4.0):
+        self.max_depth = max_depth
+        self.net = ConvMapEncoder(cond_dim, rngs, in_channels=2, n_maps=n_cams)
+
+    def __call__(self, depth: at.Float[at.Array, "b n h w"]) -> at.Float[at.Array, "b d"]:
+        d = depth.astype(jnp.float32)[..., None]
+        return self.net(jnp.concatenate([d / self.max_depth, (d > 0).astype(jnp.float32)], axis=-1))
+
+
+class PluckerEncoder(nnx.Module):
+    def __init__(self, cond_dim: int, rngs: nnx.Rngs):
+        self.net = ConvMapEncoder(cond_dim, rngs, in_channels=6, n_maps=1)
+
+    def __call__(self, plucker: at.Float[at.Array, "b 6 h w"]) -> at.Float[at.Array, "b d"]:
+        return self.net(jnp.moveaxis(plucker.astype(jnp.float32), 1, -1)[:, None])
 
 
 def farthest_point_sample(xyz: at.Float[at.Array, "b n 3"], n_samples: int) -> at.Int[at.Array, "b s"]:

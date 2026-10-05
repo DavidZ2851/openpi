@@ -1120,7 +1120,7 @@ _CONFIGS = [
         save_interval=2_000,
     ),
     # Conditional LoRA (LoRAdapter) of pi05_droid_jointpos: pi05_droid_jointpos_molmospaces_lora with
-    # every LoRA bottleneck FiLM-modulated by a condition from the exterior + wrist depth maps (DepthEncoder).
+    # every LoRA bottleneck FiLM-modulated by a condition from the exterior camera's depth map (DepthEncoder).
     # Needs a dataset converted with --depth-maps --point-cloud <task> (mlspaces_multiview_to_lerobot.py).
     TrainConfig(
         name="pi05_droid_jointpos_molmospaces_condlora_depth",
@@ -1159,6 +1159,35 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             cond_lora="pointnet",
+        ),
+        data=LeRobotMolmoSpacesCondDataConfig(
+            repo_id="local/pick_place_potato_onehouse_clean_random_cond",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,  # as the LoRA config
+        num_train_steps=20_000,
+        batch_size=8,
+        save_interval=2_000,
+    ),
+    # Conditional LoRA (LoRAdapter) of pi05_droid_jointpos: pi05_droid_jointpos_molmospaces_lora with
+    # every LoRA bottleneck FiLM-modulated by a condition from the exterior camera's Plücker ray map (PluckerEncoder).
+    # Needs a dataset converted with --plucker (mlspaces_multiview_to_lerobot.py).
+    TrainConfig(
+        name="pi05_droid_jointpos_molmospaces_condlora_plucker",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            cond_lora="plucker",
         ),
         data=LeRobotMolmoSpacesCondDataConfig(
             repo_id="local/pick_place_potato_onehouse_clean_random_cond",

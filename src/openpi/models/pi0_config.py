@@ -42,8 +42,8 @@ class Pi0Config(_model.BaseModelConfig):
 
     # Conditional LoRA (LoRAdapter): FiLM the low-rank bottleneck of every LoRA layer (needs *_lora
     # Gemma variants) with a per-sample condition from a geometry encoder (models/cond_encoders.py):
-    # "depth" (Observation.depth, DepthEncoder) or "pointnet" (Observation.point_cloud,
-    # PointNet2Encoder). None = plain LoRA.
+    # "depth" (Observation.depth, exterior camera, DepthEncoder), "pointnet" (Observation.point_cloud,
+    # PointNet2Encoder) or "plucker" (Observation.plucker, PluckerEncoder). None = plain LoRA.
     cond_lora: str | None = None
     cond_lora_dim: int = 256
 

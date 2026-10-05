@@ -140,11 +140,12 @@ class DroidRope4DInputs(droid_policy.DroidInputs):
 
 
 # ---------------------------------------------------------------------------
-# Conditional LoRA inputs (PyTorch pi0 with cond_lora). The converter (--depth-maps, --point-cloud)
-# stores per frame the exterior and wrist depth maps ("observation.depth.<camera>", flattened
-# DEPTH_SIZE^2, metres, 0 = invalid) and the fused point cloud ("observation.point_cloud",
-# flattened (1024, 3), robot base frame); the eval client sends the same, built by
-# molmospaces' molmo_spaces/utils/cond_inputs.py and dp3_pointcloud.py.
+# Conditional LoRA inputs (pi0 with cond_lora). The converter (--depth-maps, --point-cloud, --plucker)
+# stores per frame the depth maps ("observation.depth.<camera>", flattened DEPTH_SIZE^2, metres,
+# 0 = invalid; only the exterior one is used), the fused point cloud ("observation.point_cloud",
+# flattened (1024, 3), robot base frame) and the exterior camera's Plücker ray map
+# ("observation.plucker.exterior_1_left", flattened (6, PLUCKER_SIZE, PLUCKER_SIZE)); the eval
+# client sends the same, built by molmospaces' molmo_spaces/utils/cond_inputs.py and dp3_pointcloud.py.
 # ---------------------------------------------------------------------------
 @dataclasses.dataclass(frozen=True)
 class MolmoSpacesToDroidCond(transforms.DataTransformFn):
@@ -154,25 +155,28 @@ class MolmoSpacesToDroidCond(transforms.DataTransformFn):
         out = MolmoSpacesToDroid()(data)
         if "observation.depth.exterior_1_left" in data:
             out["observation/depth_exterior"] = data["observation.depth.exterior_1_left"]
-            out["observation/depth_wrist"] = data["observation.depth.wrist_left"]
         if "observation.point_cloud" in data:
             out["observation/point_cloud"] = data["observation.point_cloud"]
+        if "observation.plucker.exterior_1_left" in data:
+            out["observation/plucker_exterior"] = data["observation.plucker.exterior_1_left"]
         return out
 
 
 @dataclasses.dataclass(frozen=True)
 class DroidCondInputs(droid_policy.DroidInputs):
-    """DroidInputs plus Observation.depth ([exterior, wrist], square maps) and .point_cloud (N, 3)."""
+    """DroidInputs plus Observation.depth ((1, s, s), exterior camera), .point_cloud (N, 3) and
+    .plucker (6, p, p)."""
 
     def __call__(self, data: dict) -> dict:
         inputs = super().__call__(data)
         if "observation/depth_exterior" in data:
-            maps = [
-                np.asarray(data[k], dtype=np.float32).reshape(-1)
-                for k in ("observation/depth_exterior", "observation/depth_wrist")
-            ]
-            side = int(round(np.sqrt(maps[0].size)))
-            inputs["depth"] = np.stack([m.reshape(side, side) for m in maps])
+            depth = np.asarray(data["observation/depth_exterior"], dtype=np.float32).reshape(-1)
+            side = int(round(np.sqrt(depth.size)))
+            inputs["depth"] = depth.reshape(1, side, side)
+        if "observation/plucker_exterior" in data:
+            plucker = np.asarray(data["observation/plucker_exterior"], dtype=np.float32).reshape(6, -1)
+            side = int(round(np.sqrt(plucker.shape[1])))
+            inputs["plucker"] = plucker.reshape(6, side, side)
         if "observation/point_cloud" in data:
             inputs["point_cloud"] = np.asarray(data["observation/point_cloud"], dtype=np.float32).reshape(-1, 3)
         return inputs
