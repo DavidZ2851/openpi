@@ -1149,7 +1149,7 @@ _CONFIGS = [
         save_interval=2_000,
     ),
     # Conditional LoRA (LoRAdapter) of pi05_droid_jointpos: pi05_droid_jointpos_molmospaces_lora with
-    # every LoRA bottleneck FiLM-modulated by a condition from the fused exterior + wrist point cloud (PointNet++).
+    # every LoRA bottleneck FiLM-modulated by a condition from the exterior camera's point cloud (PointNet++).
     # Needs a dataset converted with --depth-maps --point-cloud <task> (mlspaces_multiview_to_lerobot.py).
     TrainConfig(
         name="pi05_droid_jointpos_molmospaces_condlora_pointnet",

@@ -112,7 +112,7 @@ class Observation(Generic[ArrayT]):
     patch_xyz: at.Float[ArrayT, "*b n p 3"] | None = None
     eef_xyz: at.Float[ArrayT, "*b 3"] | None = None
 
-    # Conditional LoRA inputs (pi0 with cond_lora): metric depth map(s) (0 = invalid), the fused
+    # Conditional LoRA inputs (pi0 with cond_lora): metric depth map(s) (0 = invalid), the exterior camera's
     # point cloud in the robot base frame (metres), and the exterior camera's Plücker ray map
     # (direction, moment; robot base frame).
     depth: at.Float[ArrayT, "*b ncam dh dw"] | None = None

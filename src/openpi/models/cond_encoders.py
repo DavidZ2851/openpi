@@ -7,7 +7,7 @@
 - ConvMapEncoder: a conv stack shaped like LoRAdapter's structure mapper (3x3 convs, SiLU, four
   stride-2 stages), global average pooling; the per-map vectors (shared weights) are concatenated,
   projected and LayerNorm'd (LoRAdapter's SimpleMapper).
-- PointNet2Encoder: PointNet++ with single-scale grouping on the fused point cloud (B, N, 3) in the
+- PointNet2Encoder: PointNet++ with single-scale grouping on the exterior camera's point cloud (B, N, 3) in the
   robot base frame, normalised with a fixed workspace centre/scale: two set-abstraction levels
   (farthest point sampling + ball query + shared MLP + max pool) and a global one.
 """

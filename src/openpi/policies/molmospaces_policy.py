@@ -142,7 +142,7 @@ class DroidRope4DInputs(droid_policy.DroidInputs):
 # ---------------------------------------------------------------------------
 # Conditional LoRA inputs (pi0 with cond_lora). The converter (--depth-maps, --point-cloud, --plucker)
 # stores per frame the depth maps ("observation.depth.<camera>", flattened DEPTH_SIZE^2, metres,
-# 0 = invalid; only the exterior one is used), the fused point cloud ("observation.point_cloud",
+# 0 = invalid; only the exterior one is used), the exterior camera's point cloud ("observation.point_cloud",
 # flattened (1024, 3), robot base frame) and the exterior camera's Plücker ray map
 # ("observation.plucker.exterior_1_left", flattened (6, PLUCKER_SIZE, PLUCKER_SIZE)); the eval
 # client sends the same, built by molmospaces' molmo_spaces/utils/cond_inputs.py and dp3_pointcloud.py.
