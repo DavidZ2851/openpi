@@ -127,6 +127,20 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _video_backend() -> str | None:
+    """LeRobot video backend: $LEROBOT_VIDEO_BACKEND if set; otherwise LeRobot's default
+    (torchcodec) when it can load, else pyav. torchcodec needs FFmpeg shared libraries
+    (libavutil etc.) on the machine, which e.g. cluster nodes may lack; pyav bundles its own."""
+    if backend := os.environ.get("LEROBOT_VIDEO_BACKEND"):
+        return backend
+    try:
+        import torchcodec.decoders  # noqa: F401  (loads the FFmpeg libraries)
+    except Exception as e:  # noqa: BLE001
+        logging.warning(f"torchcodec cannot load ({type(e).__name__}); decoding LeRobot videos with pyav")
+        return "pyav"
+    return None
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -138,9 +152,7 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    # LEROBOT_VIDEO_BACKEND=pyav avoids torchcodec, which needs FFmpeg shared libraries that are
-    # not installed everywhere; None keeps LeRobot's own default.
-    video_backend = os.environ.get("LEROBOT_VIDEO_BACKEND") or None
+    video_backend = _video_backend()
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
