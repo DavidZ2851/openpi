@@ -34,9 +34,12 @@ def main():
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--no-donate", action="store_true")
     ap.add_argument("--fsdp-devices", type=int, default=1)
+    ap.add_argument("--geo-feature-cache", help="override the config's cache path (other machines)")
     args = ap.parse_args()
     config = dataclasses.replace(_config.get_config(args.config), wandb_enabled=False, batch_size=args.batch_size,
                                  donate_train_state=not args.no_donate, fsdp_devices=args.fsdp_devices)
+    if args.geo_feature_cache:
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, geo_feature_cache=args.geo_feature_cache))
     mesh = sharding.make_mesh(config.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
