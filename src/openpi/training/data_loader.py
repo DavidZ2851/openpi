@@ -284,6 +284,29 @@ def create_data_loader(
     )
 
 
+class PairedViewSampler(torch.utils.data.Sampler):
+    """Indices of a multi-view LeRobot dataset whose trajectories are stored as `views` consecutive
+    episodes of equal length: a random permutation of (trajectory, timestep), each followed by the
+    same timestep in all views. Batches of a multiple of `views` thus hold whole view groups."""
+
+    def __init__(self, episode_lengths: Sequence[int], views: int, seed: int = 0):
+        lengths = np.asarray(episode_lengths)
+        if len(lengths) % views or np.any(lengths.reshape(-1, views) != lengths.reshape(-1, views)[:, :1]):
+            raise ValueError(f"paired_views={views}: episodes are not groups of {views} equal-length views")
+        starts = np.concatenate([[0], np.cumsum(lengths)[:-1]]).reshape(-1, views)
+        # (n_timesteps, views) global frame indices
+        self._groups = np.concatenate(
+            [s[None, :] + np.arange(n)[:, None] for s, n in zip(starts, lengths[::views], strict=True)]
+        )
+        self._rng = np.random.default_rng(seed)
+
+    def __len__(self) -> int:
+        return self._groups.size
+
+    def __iter__(self):
+        yield from self._groups[self._rng.permutation(len(self._groups))].reshape(-1).tolist()
+
+
 def create_torch_data_loader(
     data_config: _config.DataConfig,
     model_config: _model.BaseModelConfig,
@@ -336,6 +359,13 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+    if data_config.paired_views > 1:
+        if sampler is not None or local_batch_size % data_config.paired_views:
+            raise ValueError("paired_views needs a single process and a batch size divisible by it")
+        meta = lerobot_dataset.LeRobotDatasetMetadata(data_config.repo_id)
+        lengths = [meta.episodes[i]["length"] for i in range(meta.total_episodes)]
+        sampler = PairedViewSampler(lengths, data_config.paired_views, seed=seed)
+        logging.info(f"paired views: {local_batch_size // data_config.paired_views} timesteps x {data_config.paired_views} views per batch")
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(

@@ -118,6 +118,12 @@ class Observation(Generic[ArrayT]):
     depth: at.Float[ArrayT, "*b ncam dh dw"] | None = None
     point_cloud: at.Float[ArrayT, "*b npts 3"] | None = None
     plucker: at.Float[ArrayT, "*b 6 ph pw"] | None = None
+    # Geometry adapter input (pi0 with geo_adapter; uses `depth` too): the intrinsics of each depth map's
+    # grid (camera frame, no extrinsics).
+    intrinsics: at.Float[ArrayT, "*b ncam 3 3"] | None = None
+    # Geometry adapter input for geo_adapter="mapanything": frozen MapAnything features of the exterior
+    # camera aligned to its image tokens (mapanything_features/extractor.py), cached or computed online.
+    geo_features: at.Float[ArrayT, "*b p f"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -144,6 +150,8 @@ class Observation(Generic[ArrayT]):
             depth=data.get("depth"),
             point_cloud=data.get("point_cloud"),
             plucker=data.get("plucker"),
+            intrinsics=data.get("intrinsics"),
+            geo_features=data.get("geo_features"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -166,9 +174,13 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    exterior_spatial_aug: bool = True,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
+
+    exterior_spatial_aug=False keeps the non-wrist images' crop / resize / rotation off (colour jitter stays),
+    for inputs that are pixel-aligned with those images (depth maps, geo_features).
     """
 
     if not set(image_keys).issubset(observation.images):
@@ -188,7 +200,7 @@ def preprocess_observation(
             image = image / 2.0 + 0.5
 
             transforms = []
-            if "wrist" not in key:
+            if "wrist" not in key and exterior_spatial_aug:
                 height, width = image.shape[1:3]
                 transforms += [
                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
@@ -228,6 +240,8 @@ def preprocess_observation(
         depth=observation.depth,
         point_cloud=observation.point_cloud,
         plucker=observation.plucker,
+        intrinsics=observation.intrinsics,
+        geo_features=observation.geo_features,
     )
 
 

@@ -147,15 +147,20 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
+        if hasattr(model, "compute_loss_and_aux"):  # Pi0: flow matching + optional repr loss (Pi0Config.repr_loss)
+            chunked_loss, extra, aux = model.compute_loss_and_aux(rng, observation, actions, train=True)
+            return jnp.mean(chunked_loss) + extra, aux
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        return jnp.mean(chunked_loss), {}
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -187,8 +192,26 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **aux,
     }
     return new_state, info
+
+
+def log_trainable_params(config: _config.TrainConfig, train_state: training_utils.TrainState) -> None:
+    """Every trainable parameter's path and size, plus the trainable / frozen totals (also to wandb)."""
+    trainable = train_state.params.filter(config.trainable_filter).flat_state()
+    total = sum(int(np.prod(v.value.shape)) for v in train_state.params.flat_state().values())
+    sizes = {"/".join(map(str, k)): int(np.prod(v.value.shape)) for k, v in trainable.items()}
+    groups: dict[str, int] = {}
+    for path, n in sizes.items():
+        group = "/".join(path.split("/")[:2]) if not path.startswith("PaliGemma/llm") else path.split("/")[2] + ("/expert" if "_1" in path else "/vlm")
+        groups[group] = groups.get(group, 0) + n
+    n_train = sum(sizes.values())
+    logging.info("Trainable parameters (%d tensors):\n%s", len(sizes), "\n".join(f"  {k}: {v:,}" for k, v in sizes.items()))
+    logging.info("Trainable by group: %s", {k: f"{v:,}" for k, v in sorted(groups.items())})
+    logging.info("Trainable %s / total %s (%.3f%%), frozen %s", f"{n_train:,}", f"{total:,}", 100 * n_train / total, f"{total - n_train:,}")
+    if wandb.run is not None:
+        wandb.run.summary.update({"params/trainable": n_train, "params/total": total, **{f"params/{k}": v for k, v in groups.items()}})
 
 
 def main(config: _config.TrainConfig):
@@ -217,6 +240,10 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    if getattr(config.model, "repr_loss", None) is not None:
+        data_cfg = config.data.create(config.assets_dirs, config.model)
+        if data_cfg.paired_views != 2 or config.batch_size % 2:
+            raise ValueError("repr_loss pairs rows 2i / 2i+1: needs DataConfig.paired_views=2 and an even batch size")
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
@@ -236,6 +263,7 @@ def main(config: _config.TrainConfig):
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    log_trainable_params(config, train_state)
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
@@ -244,7 +272,7 @@ def main(config: _config.TrainConfig):
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
+        donate_argnums=(1,) if config.donate_train_state else (),
     )
 
     start_step = int(train_state.step)
@@ -259,6 +287,9 @@ def main(config: _config.TrainConfig):
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+        if not config.donate_train_state:
+            # without donation every queued step holds a whole new train state: run one at a time
+            jax.block_until_ready(train_state)
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)

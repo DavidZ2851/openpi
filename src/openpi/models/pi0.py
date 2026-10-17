@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import cond_encoders as _cond_encoders
+from openpi.models import geo_adapter as _geo_adapter
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
@@ -113,6 +114,22 @@ class Pi0(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        self.geo_adapter = config.geo_adapter
+        if config.geo_adapter is not None:
+            # "lora" in the name: initialised by the weight loader, trainable under the LoRA freeze filter.
+            self.lora_geo_adapter = _geo_adapter.GeoAdapter(
+                paligemma_config.width,
+                config.geo_adapter,
+                rngs,
+                bottleneck=config.geo_adapter_bottleneck,
+                feature_dim=config.geo_feature_dim,
+            )
+        self.exterior_spatial_aug = config.exterior_spatial_aug
+        self.repr_loss = config.repr_loss
+        self.repr_cfg = (config.repr_lambda_inv, config.repr_lambda_var, config.repr_lambda_cov, config.repr_var_gamma)
+        if config.repr_loss is not None:
+            # training-only head ("lora" in the name, as the adapter's)
+            self.lora_repr_head = _geo_adapter.ReprHead(paligemma_config.width, rngs, out_dim=config.repr_dim)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -127,15 +144,21 @@ class Pi0(_model.BaseModel):
         self.deterministic = True
 
     @at.typecheck
-    def embed_prefix(
-        self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    def embed_prefix(self, obs: _model.Observation, *, return_parts: bool = False):
+        """(tokens, input_mask, ar_mask); with return_parts also a dict of the adapted exterior image
+        tokens ("exterior") and the prompt embeddings ("prompt", "prompt_mask"), for the repr loss."""
         input_mask = []
         ar_mask = []
         tokens = []
+        parts = {}
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            if self.geo_adapter is not None and name == "base_0_rgb":  # the exterior camera (DROID layout)
+                depth = None if obs.depth is None else obs.depth[:, 0]
+                intrinsics = None if obs.intrinsics is None else obs.intrinsics[:, 0]
+                image_tokens = self.lora_geo_adapter(image_tokens, depth, intrinsics, obs.geo_features)
+                parts["exterior"] = image_tokens
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -151,6 +174,7 @@ class Pi0(_model.BaseModel):
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            parts["prompt"], parts["prompt_mask"] = tokenized_inputs, obs.tokenized_prompt_mask
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
@@ -158,6 +182,8 @@ class Pi0(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
+        if return_parts:
+            return tokens, input_mask, ar_mask, parts
         return tokens, input_mask, ar_mask
 
     @at.typecheck
@@ -223,8 +249,17 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        return self.compute_loss_and_aux(rng, observation, actions, train=train)[0]
+
+    def compute_loss_and_aux(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], at.Float[at.Array, ""], dict[str, at.Array]]:
+        """The flow-matching loss per sample and action step, plus Pi0Config.repr_loss's weighted total
+        (a scalar; 0 when off) and its terms for logging."""
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, exterior_spatial_aug=self.exterior_spatial_aug
+        )
         lora_cond = self._lora_cond(observation)
 
         batch_shape = actions.shape[:-2]
@@ -235,7 +270,7 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, parts = self.embed_prefix(observation, return_parts=True)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
@@ -249,8 +284,20 @@ class Pi0(_model.BaseModel):
             lora_cond=lora_cond,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        fm = jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        extra, aux = jnp.zeros((), jnp.float32), {}
+        if self.repr_loss is not None:
+            lam_inv, lam_var, lam_cov, gamma = self.repr_cfg
+            z = self.lora_repr_head(parts["exterior"], parts["prompt"], parts["prompt_mask"])
+            terms = _geo_adapter.repr_losses(z, self.repr_loss, gamma)
+            extra = lam_inv * terms["inv"]
+            if self.repr_loss == "vicreg":
+                extra = extra + lam_var * terms["var"] + lam_cov * terms["cov"]
+            aux = {f"repr/{k}": v for k, v in terms.items()}
+            aux["repr/total"] = extra
+            aux["loss_fm"] = jnp.mean(fm)
+        return fm, extra, aux
 
     @override
     def sample_actions(

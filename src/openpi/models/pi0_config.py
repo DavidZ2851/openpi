@@ -47,11 +47,42 @@ class Pi0Config(_model.BaseModelConfig):
     cond_lora: str | None = None
     cond_lora_dim: int = 256
 
+    # Geometry-conditioned residual adapter (models/geo_adapter.py) on the exterior camera's image tokens,
+    # between SigLIP and the VLM: F' = F + sigmoid(gate(z)) * up(gelu(down(z))), z = [LN(F), g], with g a
+    # per-patch geometry embedding from the exterior depth map + its intrinsics (Observation.depth,
+    # .intrinsics; camera frame, no extrinsics). geo_adapter picks g: "rgb" (none), "depth" (the patch's
+    # raw depths), "xyz" (camera-frame patch centroid), "relative" (scale-normalised local shape, normal,
+    # relative depth). None = no adapter.
+    # "mapanything": g from frozen MapAnything features of the exterior view (Observation.geo_features,
+    # geo_feature_dim channels: mapanything_features/extractor.py), through a trainable projection.
+    geo_adapter: str | None = None
+    geo_adapter_bottleneck: int = 64
+    geo_feature_dim: int = 1538
+    # Spatial augmentation (crop / rotate) of the exterior image in training. Off for inputs that are
+    # pixel-aligned with it (geo_features; depth for the depth-based adapters), so they stay aligned.
+    exterior_spatial_aug: bool = True
+
+    # Cross-view representation loss on the adapted exterior tokens (needs geo_adapter and paired-view
+    # batches: DataConfig.paired_views=2, rows 2i / 2i+1 = the same timestep seen by views A / B).
+    # Z = h(TaskPool(F', prompt)) per sample (models/geo_adapter.py ReprHead; pi0.5's prompt holds the
+    # task and the discretised state). "inv": lambda_inv * mean_i ||Z_A^i - Z_B^i||^2; "vicreg": that plus
+    # lambda_var * variance hinge + lambda_cov * off-diagonal covariance (per branch, averaged). None = off.
+    repr_loss: str | None = None
+    repr_dim: int = 128
+    repr_lambda_inv: float = 0.01
+    repr_lambda_var: float = 1.0
+    repr_lambda_cov: float = 0.04
+    repr_var_gamma: float = 1.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.repr_loss not in (None, "inv", "vicreg"):
+            raise ValueError(f"repr_loss must be None, 'inv' or 'vicreg', got {self.repr_loss!r}")
+        if self.repr_loss is not None and self.geo_adapter is None:
+            raise ValueError("repr_loss needs geo_adapter (it trains the adapter's output tokens)")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",

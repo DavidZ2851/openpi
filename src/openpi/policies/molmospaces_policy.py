@@ -147,6 +147,26 @@ class DroidRope4DInputs(droid_policy.DroidInputs):
 # ("observation.plucker.exterior_1_left", flattened (6, PLUCKER_SIZE, PLUCKER_SIZE)); the eval
 # client sends the same, built by molmospaces' molmo_spaces/utils/cond_inputs.py and dp3_pointcloud.py.
 # ---------------------------------------------------------------------------
+_GEO_CACHES: dict[str, np.ndarray] = {}
+
+
+@dataclasses.dataclass(frozen=True)
+class AddCachedGeoFeatures(transforms.DataTransformFn):
+    """Training: the exterior view's cached geometry features (mapanything_features/cache.py), row = the
+    LeRobot frame's global index, as "observation.geo_features.exterior_1_left". Opened lazily (memmap) in
+    each data-loader worker. Valid only while the exterior image is not spatially augmented
+    (Pi0Config.exterior_spatial_aug=False): the features are aligned to the unaugmented frame."""
+
+    cache_path: str
+
+    def __call__(self, data: dict) -> dict:
+        cache = _GEO_CACHES.get(self.cache_path)
+        if cache is None:
+            cache = _GEO_CACHES[self.cache_path] = np.load(self.cache_path, mmap_mode="r")
+        index = int(np.asarray(data["index"]))
+        return {**data, "observation.geo_features.exterior_1_left": np.asarray(cache[index], dtype=np.float32)}
+
+
 @dataclasses.dataclass(frozen=True)
 class MolmoSpacesToDroidCond(transforms.DataTransformFn):
     """MolmoSpacesToDroid plus whichever condition inputs the dataset has."""
@@ -159,13 +179,17 @@ class MolmoSpacesToDroidCond(transforms.DataTransformFn):
             out["observation/point_cloud"] = data["observation.point_cloud"]
         if "observation.plucker.exterior_1_left" in data:
             out["observation/plucker_exterior"] = data["observation.plucker.exterior_1_left"]
+        if "observation.intrinsics.exterior_1_left" in data:
+            out["observation/intrinsics_exterior"] = data["observation.intrinsics.exterior_1_left"]
+        if "observation.geo_features.exterior_1_left" in data:
+            out["observation/geo_features_exterior"] = data["observation.geo_features.exterior_1_left"]
         return out
 
 
 @dataclasses.dataclass(frozen=True)
 class DroidCondInputs(droid_policy.DroidInputs):
-    """DroidInputs plus Observation.depth ((1, s, s), exterior camera), .point_cloud (N, 3) and
-    .plucker (6, p, p)."""
+    """DroidInputs plus Observation.depth ((1, s, s), exterior camera), .intrinsics ((1, 3, 3), of that
+    depth map's grid), .point_cloud (N, 3) and .plucker (6, p, p)."""
 
     def __call__(self, data: dict) -> dict:
         inputs = super().__call__(data)
@@ -177,6 +201,10 @@ class DroidCondInputs(droid_policy.DroidInputs):
             plucker = np.asarray(data["observation/plucker_exterior"], dtype=np.float32).reshape(6, -1)
             side = int(round(np.sqrt(plucker.shape[1])))
             inputs["plucker"] = plucker.reshape(6, side, side)
+        if "observation/intrinsics_exterior" in data:
+            inputs["intrinsics"] = np.asarray(data["observation/intrinsics_exterior"], dtype=np.float32).reshape(1, 3, 3)
+        if "observation/geo_features_exterior" in data:  # (tokens, features), e.g. MapAnything's (256, 1538)
+            inputs["geo_features"] = np.asarray(data["observation/geo_features_exterior"], dtype=np.float32)
         if "observation/point_cloud" in data:
             inputs["point_cloud"] = np.asarray(data["observation/point_cloud"], dtype=np.float32).reshape(-1, 3)
         return inputs

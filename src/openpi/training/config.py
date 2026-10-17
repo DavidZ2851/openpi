@@ -23,6 +23,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.molmospaces_policy as molmospaces_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -91,6 +92,11 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Multi-view datasets that store each camera of a trajectory as consecutive episodes (2k, 2k+1, ...,
+    # same length; mlspaces_multiview_to_lerobot.py): with paired_views = V > 1, every batch holds all V
+    # views of the same timesteps (batch_size / V timesteps x V views) instead of independent frames.
+    paired_views: int = 1
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -574,6 +580,63 @@ class LeRobotMolmoSpacesCondDataConfig(LeRobotMolmoSpacesDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotMolmoSpacesGeoFeatureDataConfig(LeRobotMolmoSpacesCondDataConfig):
+    """LeRobotMolmoSpacesCondDataConfig plus cached per-token geometry features of the exterior view
+    (Observation.geo_features; mapanything_features/cache.py), looked up by the frame's global index.
+    Serving gets them online instead ("observation/geo_features_exterior", mapanything_features/proxy.py)."""
+
+    geo_feature_cache: str = tyro.MISSING
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        config = super().create(assets_dirs, model_config)
+        return dataclasses.replace(
+            config,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    molmospaces_policy.AddCachedGeoFeatures(self.geo_feature_cache),
+                    molmospaces_policy.MolmoSpacesToDroidCond(),
+                ]
+            ),
+        )
+
+
+def _mapanything_config(name: str, repr_loss: str | None) -> "TrainConfig":
+    """M1 / M2 / M3: frozen MapAnything features -> trainable projection + gated adapter on the exterior
+    tokens, Action Expert LoRA (rank 32 on attention + FFN of all 18 layers), flow matching, paired views;
+    repr_loss None / "inv" / "vicreg". Everything else is frozen: SigLIP, Gemma 2B (no LoRA), the action
+    expert's own weights and pi0.5's action / time projections."""
+    return TrainConfig(
+        name=name,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m_lora",
+            geo_adapter="mapanything",
+            geo_feature_dim=1538,
+            exterior_spatial_aug=False,  # the cached features are aligned to the unaugmented frame
+            repr_loss=repr_loss,
+        ),
+        data=LeRobotMolmoSpacesGeoFeatureDataConfig(
+            repo_id="local/pick_place_potato_onehouse_two_random_geo",
+            geo_feature_cache="/data/haotian/mapanything/cache/potato_two_random_final.npy",
+            # each batch: batch_size / 2 timesteps x both views (same state, action and prompt)
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",), paired_views=2),
+            assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
+        # trainable: every "lora" param = Action Expert LoRA (the VLM variant has none), lora_geo_adapter
+        # (projection + adapter) and lora_repr_head (M2 / M3)
+        freeze_filter=nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+        ema_decay=None,
+        num_train_steps=20_000,
+        batch_size=8,
+        save_interval=2_000,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -644,6 +707,12 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+
+    # Donate the train state's buffers to the jitted train step (saves memory). False works around a
+    # buffer-donation miscompile seen with a trainable SigLIP + the geometry adapter (+ LoRA): the donated
+    # train step computes a wrong loss from step 0 (5.05 vs 3.12 on the same state and batch) and training
+    # collapses to loss 1.0. Without donation the step needs more than a 24 GB GPU; freezing SigLIP avoids it.
+    donate_train_state: bool = True
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -1206,6 +1275,62 @@ _CONFIGS = [
         batch_size=8,
         save_interval=2_000,
     ),
+    # Geometry-conditioned residual adapter (models/geo_adapter.py) on the exterior camera's SigLIP tokens,
+    # everything else frozen (frozen VLA + adapter). --model.geo-adapter picks the geometry: relative
+    # (default), xyz, depth or rgb (no geometry). Few-shot viewpoint generalisation: trained on the
+    # two-view potato data (20 trajectories x 2 random views), evaluated on fresh random views. Needs a
+    # dataset converted with --depth-maps (exterior depth map + its intrinsics).
+    TrainConfig(
+        name="pi05_droid_jointpos_molmospaces_geoadapter",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=15, geo_adapter="relative"),
+        data=LeRobotMolmoSpacesCondDataConfig(
+            repo_id="local/pick_place_potato_onehouse_two_random_geo",
+            # each batch: 4 timesteps x both views (same state and action, two images)
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",), paired_views=2),
+            assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
+        freeze_filter=nnx.Not(nnx_utils.PathRegex(".*lora_geo_adapter.*")),
+        ema_decay=None,
+        # a freshly initialised adapter: 4x the LoRA configs' peak lr
+        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=1e-4, decay_lr=1e-5),
+        num_train_steps=20_000,
+        batch_size=8,
+        save_interval=2_000,
+    ),
+    # pi05_droid_jointpos_molmospaces_lora (same LoRA ranks, lr, batch, steps) plus the geometry adapter, with
+    # SigLIP frozen as well (the LoRA config trains it fully). --model.geo-adapter None gives the matching
+    # plain-LoRA baseline (frozen SigLIP, same paired data).
+    TrainConfig(
+        name="pi05_droid_jointpos_molmospaces_lora_geoadapter",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            geo_adapter="relative",
+        ),
+        data=LeRobotMolmoSpacesCondDataConfig(
+            repo_id="local/pick_place_potato_onehouse_two_random_geo",
+            # each batch: 4 timesteps x both views (same state and action, two images)
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",), paired_views=2),
+            assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
+        freeze_filter=nnx.Any(
+            pi0_config.Pi0Config(
+                pi05=True,
+                action_horizon=15,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+            nnx_utils.PathRegex(".*PaliGemma/img.*"),  # SigLIP (see TrainConfig.donate_train_state)
+        ),
+        ema_decay=None,  # as the LoRA config
+        num_train_steps=20_000,
+        batch_size=8,
+        save_interval=2_000,
+    ),
     # LoRA fine-tune of the original pi05_droid on a MolmoSpaces dataset, with an end-effector
     # action space (chunk-relative eef_9d deltas in the robot base frame + absolute gripper).
     # Compute norm stats first: scripts/compute_norm_stats.py --config-name pi05_droid_molmospaces_eef_lora
@@ -1282,9 +1407,50 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    # MapAnything geometry adapter + Action Expert LoRA (M1), + cross-view invariance (M2), + VICReg (M3).
+    _mapanything_config("pi05_droid_jointpos_molmospaces_mapanything_m1", None),
+    _mapanything_config("pi05_droid_jointpos_molmospaces_mapanything_m2", "inv"),
+    _mapanything_config("pi05_droid_jointpos_molmospaces_mapanything_m3", "vicreg"),
+    # M1 with the standard LoRA trainable set (pi05_droid_jointpos_molmospaces_lora's freeze filter): SigLIP
+    # fully trained, LoRA on Gemma 2B and the action expert, action / time projections trained, plus the
+    # MapAnything projection + adapter. Batch / steps as the LoRA baselines. Trainable SigLIP + adapter hits
+    # the donation bug (donated train step's loss ~2 too high from step 0; mapanything_features/donation_check.py),
+    # so no donation, FSDP over 2 GPUs to fit (13.1 GB each at batch 8).
+    dataclasses.replace(
+        _mapanything_config("pi05_droid_jointpos_molmospaces_mapanything_m1_lora", None),
+        model=dataclasses.replace(
+            _mapanything_config("", None).model, paligemma_variant="gemma_2b_lora"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        donate_train_state=False,
+        fsdp_devices=2,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+]
+
+
+def _with_geo_adapter(name: str, base: str, geo_adapter: str | None) -> TrainConfig:
+    """The geoadapter configs with another Pi0Config.geo_adapter, for serving checkpoints trained with
+    --model.geo-adapter overridden."""
+    (config,) = [c for c in _CONFIGS if c.name == base]
+    return dataclasses.replace(config, name=name, model=dataclasses.replace(config.model, geo_adapter=geo_adapter))
+
+
+_CONFIGS += [
+    _with_geo_adapter("pi05_droid_jointpos_molmospaces_geoadapter_rgb", "pi05_droid_jointpos_molmospaces_geoadapter", "rgb"),
+    _with_geo_adapter(
+        "pi05_droid_jointpos_molmospaces_lora_geoadapter_rgb", "pi05_droid_jointpos_molmospaces_lora_geoadapter", "rgb"
+    ),
+    _with_geo_adapter(
+        "pi05_droid_jointpos_molmospaces_lora_frozenvis", "pi05_droid_jointpos_molmospaces_lora_geoadapter", None
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
