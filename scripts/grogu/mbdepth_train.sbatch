@@ -8,7 +8,7 @@
 #
 # lora / full train with JAX (scripts/train.py, FSDP over the job's GPUs); rope4d trains with PyTorch
 # (scripts/train_pytorch.py, DDP over the job's GPUs; the global batch 32 is split across them).
-# Paths below default to the grogu layout; override with the environment.
+# Paths below default to the grogu layout; override with the environment (OPENPI, VENV, HF_LEROBOT_HOME, ...).
 #SBATCH --job-name=mbdepth
 #SBATCH --partition=dheld
 #SBATCH --nodes=1
@@ -19,6 +19,7 @@
 set -euo pipefail
 MODE=${1:?lora | full | rope4d}
 OPENPI=${OPENPI:-$HOME/openpi}
+VENV=${VENV:-$OPENPI/.venv}
 export HF_LEROBOT_HOME=${HF_LEROBOT_HOME:-/scratch/haotian/lerobot}
 export PI05_JOINTPOS_DIR=${PI05_JOINTPOS_DIR:-$OPENPI/checkpoints/pi05_droid_jointpos}
 export PI05_JOINTPOS_PYTORCH_DIR=${PI05_JOINTPOS_PYTORCH_DIR:-${PI05_JOINTPOS_DIR}_pytorch}
@@ -28,12 +29,12 @@ cd "$OPENPI"
 echo "[$(date)] $MODE on $(hostname), $NGPU GPU(s): $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
 case $MODE in
   lora | full)
-    exec .venv/bin/python scripts/train.py pi05_droid_jointpos_mbdepth_$MODE --exp-name mbdepth_$MODE \
+    exec "$VENV"/bin/python scripts/train.py pi05_droid_jointpos_mbdepth_$MODE --exp-name mbdepth_$MODE \
       --fsdp-devices "$NGPU" --resume ;;
   rope4d)
     # train_pytorch.py --resume fails without an existing run, unlike train.py's.
     RESUME=(); [ -d checkpoints/pi05_droid_jointpos_mbdepth_rope4d_full/mbdepth_rope4d_full ] && RESUME=(--resume)
-    exec .venv/bin/torchrun --standalone --nnodes=1 --nproc_per_node="$NGPU" scripts/train_pytorch.py \
+    exec "$VENV"/bin/torchrun --standalone --nnodes=1 --nproc_per_node="$NGPU" scripts/train_pytorch.py \
       pi05_droid_jointpos_mbdepth_rope4d_full --exp_name mbdepth_rope4d_full "${RESUME[@]}" ;;
   *) echo "unknown mode $MODE" >&2; exit 1 ;;
 esac
