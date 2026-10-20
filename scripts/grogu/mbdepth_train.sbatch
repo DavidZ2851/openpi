@@ -22,6 +22,8 @@ MODE=${1:?lora | full | rope4d}
 OPENPI=${OPENPI:-$HOME/openpi}
 VENV=${VENV:-$OPENPI/.venv}
 export HF_LEROBOT_HOME=${HF_LEROBOT_HOME:-/scratch/haotian/lerobot}
+# Dataset at $HF_LEROBOT_HOME/$REPO_ID (the config says local/mbdepth_mix_rope4d).
+REPO_ID=${REPO_ID:-local/mbdepth_mix_rope4d}
 export PI05_JOINTPOS_DIR=${PI05_JOINTPOS_DIR:-$OPENPI/checkpoints/pi05_droid_jointpos}
 export PI05_JOINTPOS_PYTORCH_DIR=${PI05_JOINTPOS_PYTORCH_DIR:-${PI05_JOINTPOS_DIR}_pytorch}
 export HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
@@ -30,12 +32,12 @@ cd "$OPENPI"
 echo "[$(date)] $MODE on $(hostname), $NGPU GPU(s): $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
 case $MODE in
   lora | full)
-    exec "$VENV"/bin/python scripts/train.py pi05_droid_jointpos_mbdepth_$MODE --exp-name mbdepth_$MODE \
+    exec "$VENV"/bin/python scripts/train.py pi05_droid_jointpos_mbdepth_$MODE --exp-name mbdepth_$MODE --data.repo-id "$REPO_ID" \
       --fsdp-devices "$NGPU" --resume ;;
   rope4d)
     # train_pytorch.py --resume fails without an existing run, unlike train.py's.
     RESUME=(); [ -d checkpoints/pi05_droid_jointpos_mbdepth_rope4d_full/mbdepth_rope4d_full ] && RESUME=(--resume)
     exec "$VENV"/bin/torchrun --standalone --nnodes=1 --nproc_per_node="$NGPU" scripts/train_pytorch.py \
-      pi05_droid_jointpos_mbdepth_rope4d_full --exp_name mbdepth_rope4d_full "${RESUME[@]}" ;;
+      pi05_droid_jointpos_mbdepth_rope4d_full --exp_name mbdepth_rope4d_full --data.repo-id "$REPO_ID" "${RESUME[@]}" ;;
   *) echo "unknown mode $MODE" >&2; exit 1 ;;
 esac
