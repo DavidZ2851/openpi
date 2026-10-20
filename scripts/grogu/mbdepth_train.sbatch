@@ -2,12 +2,13 @@
 # MolmoBot-Data depth mixture (local/mbdepth_mix_rope4d): LoRA, full fine-tune, full fine-tune + 4D RoPE,
 # batch 32 x 30k steps each (config.py _mbdepth). One job per model:
 #
-#   sbatch --gres=gpu:4 scripts/grogu/mbdepth_train.sbatch lora
-#   sbatch --gres=gpu:4 scripts/grogu/mbdepth_train.sbatch full
-#   sbatch --gres=gpu:4 scripts/grogu/mbdepth_train.sbatch rope4d
+#   sbatch --gres=gpu:1 scripts/grogu/mbdepth_train.sbatch lora
+#   sbatch --gres=gpu:1 scripts/grogu/mbdepth_train.sbatch full
+#   sbatch --gres=gpu:1 scripts/grogu/mbdepth_train.sbatch rope4d
 #
 # lora / full train with JAX (scripts/train.py, FSDP over the job's GPUs); rope4d trains with PyTorch
-# (scripts/train_pytorch.py, DDP over the job's GPUs; the global batch 32 is split across them).
+# (scripts/train_pytorch.py, DDP over the job's GPUs; the global batch 32 is split across them). One >=80 GB GPU
+# fits each run; more GPUs only add speed (full FT on 48 GB cards needs 2 for FSDP).
 # Paths below default to the grogu layout; override with the environment (OPENPI, VENV, HF_LEROBOT_HOME, ...).
 #SBATCH --job-name=mbdepth
 #SBATCH --partition=dheld
