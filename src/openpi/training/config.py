@@ -472,9 +472,7 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 # Directory holding the pi05_droid_jointpos checkpoint (assets/ and params/). Override with
 # PI05_JOINTPOS_DIR so the same config works on machines that store it elsewhere.
-PI05_JOINTPOS_DIR = os.environ.get(
-    "PI05_JOINTPOS_DIR", "/home/haotian/openpi/checkpoints/pi05_droid_jointpos"
-)
+PI05_JOINTPOS_DIR = os.environ.get("PI05_JOINTPOS_DIR", "/home/haotian/openpi/checkpoints/pi05_droid_jointpos")
 
 
 # Original pi05_droid checkpoint (joint-velocity model), the starting point for the EEF fine-tunes.
@@ -513,11 +511,15 @@ class LeRobotMolmoSpacesDataConfig(DataConfigFactory):
     the *_jointpos checkpoints predict (their inference-time AbsoluteActions undoes this).
     """
 
+    # pi0.5 image keys removed from the input (droid_policy.MaskCameras), e.g. ("base_0_rgb",) = wrist only.
+    masked_cameras: tuple[str, ...] = ()
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(inputs=[molmospaces_policy.MolmoSpacesToDroid()])
         data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)]
+            + ([droid_policy.MaskCameras(self.masked_cameras)] if self.masked_cameras else []),
             outputs=[droid_policy.DroidOutputs()],
         )
         delta_action_mask = _transforms.make_bool_mask(7, -1)  # joints delta, gripper absolute
@@ -1135,9 +1137,7 @@ _CONFIGS = [
                 asset_id="droid",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            f"{PI05_JOINTPOS_DIR}/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{PI05_JOINTPOS_DIR}/params"),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=15,
@@ -1180,9 +1180,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
             assets=AssetsConfig(assets_dir=f"{PI05_JOINTPOS_DIR}/assets", asset_id="droid"),
         ),
-        pytorch_weight_path=os.environ.get(
-            "PI05_JOINTPOS_PYTORCH_DIR", f"{PI05_JOINTPOS_DIR}_pytorch"
-        ),
+        pytorch_weight_path=os.environ.get("PI05_JOINTPOS_PYTORCH_DIR", f"{PI05_JOINTPOS_DIR}_pytorch"),
         # Same batch size and steps as pi05_droid_jointpos_molmospaces_lora (like-for-like).
         num_train_steps=20_000,
         batch_size=8,
@@ -1418,9 +1416,7 @@ _CONFIGS = [
     # so no donation, FSDP over 2 GPUs to fit (13.1 GB each at batch 8).
     dataclasses.replace(
         _mapanything_config("pi05_droid_jointpos_molmospaces_mapanything_m1_lora", None),
-        model=dataclasses.replace(
-            _mapanything_config("", None).model, paligemma_variant="gemma_2b_lora"
-        ),
+        model=dataclasses.replace(_mapanything_config("", None).model, paligemma_variant="gemma_2b_lora"),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=15,
@@ -1444,7 +1440,9 @@ def _with_geo_adapter(name: str, base: str, geo_adapter: str | None) -> TrainCon
 
 
 _CONFIGS += [
-    _with_geo_adapter("pi05_droid_jointpos_molmospaces_geoadapter_rgb", "pi05_droid_jointpos_molmospaces_geoadapter", "rgb"),
+    _with_geo_adapter(
+        "pi05_droid_jointpos_molmospaces_geoadapter_rgb", "pi05_droid_jointpos_molmospaces_geoadapter", "rgb"
+    ),
     _with_geo_adapter(
         "pi05_droid_jointpos_molmospaces_lora_geoadapter_rgb", "pi05_droid_jointpos_molmospaces_lora_geoadapter", "rgb"
     ),
@@ -1452,6 +1450,46 @@ _CONFIGS += [
         "pi05_droid_jointpos_molmospaces_lora_frozenvis", "pi05_droid_jointpos_molmospaces_lora_geoadapter", None
     ),
 ]
+
+
+def _frozenvis_mapanything(name: str) -> TrainConfig:
+    """E2: pi05_droid_jointpos_molmospaces_lora_frozenvis (frozen SigLIP; LoRA on Gemma 2B and the action
+    expert; action / time projections trained; same lr, batch, steps, seed) plus M1's frozen MapAnything
+    features -> trainable projection + adapter. The only other change is exterior_spatial_aug=False, which
+    the cached features need (they are aligned to the unaugmented frame). The _geo dataset holds the same
+    frames as the baseline's local/pick_place_potato_onehouse_two_random, plus the depth the cache needs."""
+    (base,) = [c for c in _CONFIGS if c.name == "pi05_droid_jointpos_molmospaces_lora_frozenvis"]
+    (m1,) = [c for c in _CONFIGS if c.name == "pi05_droid_jointpos_molmospaces_mapanything_m1"]
+    return dataclasses.replace(
+        base,
+        name=name,
+        model=dataclasses.replace(
+            base.model,
+            geo_adapter=m1.model.geo_adapter,
+            geo_feature_dim=m1.model.geo_feature_dim,
+            exterior_spatial_aug=m1.model.exterior_spatial_aug,
+        ),
+        data=dataclasses.replace(m1.data, base_config=base.data.base_config, assets=base.data.assets),
+    )
+
+
+_CONFIGS += [_frozenvis_mapanything("pi05_droid_jointpos_molmospaces_lora_frozenvis_mapanything")]
+
+
+# Camera-dependency experiments: the standard LoRA recipe (pi05_droid_jointpos_molmospaces_lora) with cameras removed by
+# pi0.5's own mechanism (zero image + image_mask False). Used for inference-time masking of a full-camera checkpoint
+# and for fine-tuning without a camera; everything else is identical to the base config.
+def _masked_cameras(name: str, cameras: tuple[str, ...]) -> TrainConfig:
+    (base,) = [c for c in _CONFIGS if c.name == "pi05_droid_jointpos_molmospaces_lora"]
+    return dataclasses.replace(base, name=name, data=dataclasses.replace(base.data, masked_cameras=cameras))
+
+
+_CONFIGS += [
+    _masked_cameras("pi05_droid_jointpos_molmospaces_lora_wristonly", ("base_0_rgb",)),
+    _masked_cameras("pi05_droid_jointpos_molmospaces_lora_extonly", ("left_wrist_0_rgb",)),
+    _masked_cameras("pi05_droid_jointpos_molmospaces_lora_nocam", ("base_0_rgb", "left_wrist_0_rgb")),
+]
+
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

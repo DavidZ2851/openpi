@@ -75,6 +75,22 @@ class DroidInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class MaskCameras(transforms.DataTransformFn):
+    """Removes cameras the way pi0.5 already removes DROID's absent right-wrist camera: zero image and image_mask
+    False. Masked image tokens are dropped from the attention mask (pi0.embed_prefix input_mask), so no token, prefix
+    or action, can attend to them. Apply after DroidInputs."""
+
+    cameras: tuple[str, ...]
+
+    def __call__(self, data: dict) -> dict:
+        images, masks = dict(data["image"]), dict(data["image_mask"])
+        for name in self.cameras:
+            images[name] = np.zeros_like(images[name])
+            masks[name] = np.False_
+        return {**data, "image": images, "image_mask": masks}
+
+
+@dataclasses.dataclass(frozen=True)
 class DroidOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first 8 dims.

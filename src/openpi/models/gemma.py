@@ -154,6 +154,11 @@ class Embedder(nn.Module):
         return jnp.dot(x, self.input_embedding_table.T)
 
 
+# Optional callable(probs (B, K, G, T, S)) invoked inside Attention, e.g. to export attention maps with
+# jax.debug.callback. None (the default) changes nothing.
+ATTN_PROBS_HOOK = None
+
+
 @at.typecheck
 class Attention(nn.Module):
     """Attention module."""
@@ -226,6 +231,8 @@ class Attention(nn.Module):
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+        if ATTN_PROBS_HOOK is not None:  # analysis only (scripts/attention_probe.py); traced once per layer call
+            ATTN_PROBS_HOOK(probs)
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
