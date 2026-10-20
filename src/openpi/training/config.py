@@ -11,6 +11,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -535,6 +536,20 @@ class LeRobotMolmoSpacesDataConfig(DataConfigFactory):
         )
 
 
+def _action_affine(config: DataConfig) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+    """(scale, offset) undoing Normalize on the 7 joint-delta action dims: raw = normalized * scale + offset."""
+    if config.norm_stats is None:
+        return None
+    stats = config.norm_stats["actions"]
+    if config.use_quantile_norm:
+        scale = (np.asarray(stats.q99[:7]) - np.asarray(stats.q01[:7]) + 1e-6) / 2.0
+        offset = scale + np.asarray(stats.q01[:7])
+    else:
+        scale = np.asarray(stats.std[:7]) + 1e-6
+        offset = np.asarray(stats.mean[:7])
+    return tuple(map(float, scale)), tuple(map(float, offset))
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotMolmoSpacesRope4DDataConfig(LeRobotMolmoSpacesDataConfig):
     """LeRobotMolmoSpacesDataConfig plus the 4D RoPE inputs (patch point grids + gripper position).
@@ -553,7 +568,12 @@ class LeRobotMolmoSpacesRope4DDataConfig(LeRobotMolmoSpacesDataConfig):
             repack_transforms=_transforms.Group(inputs=[molmospaces_policy.MolmoSpacesToDroidRope4D()]),
             data_transforms=dataclasses.replace(
                 config.data_transforms,
-                inputs=[molmospaces_policy.DroidRope4DInputs(model_type=model_config.model_type), *rest],
+                inputs=[
+                    molmospaces_policy.DroidRope4DInputs(
+                        model_type=model_config.model_type, action_affine=_action_affine(config)
+                    ),
+                    *rest,
+                ],
             ),
         )
 
@@ -1490,6 +1510,28 @@ _CONFIGS += [
     _masked_cameras("pi05_droid_jointpos_molmospaces_lora_nocam", ("base_0_rgb", "left_wrist_0_rgb")),
 ]
 
+
+# MolmoBot-Data pick & place mixture with re-rendered exterior depth (molmospaces rerender_mb_depth.py; pnp,
+# backfill, next-to, color: 207 trajectories x 4 exterior views = 828 episodes, 219k frames; converted with
+# --patch-xyz). LoRA, full fine-tune and full fine-tune + 4D RoPE share the data and the schedule: batch 32,
+# 30k steps (= the cosine decay length), about 4.4 epochs.
+def _mbdepth(name: str, base_name: str) -> TrainConfig:
+    (base,) = [c for c in _CONFIGS if c.name == base_name]
+    return dataclasses.replace(
+        base,
+        name=name,
+        data=dataclasses.replace(base.data, repo_id="local/mbdepth_mix_rope4d"),
+        batch_size=32,
+        num_train_steps=30_000,
+        save_interval=5_000,
+    )
+
+
+_CONFIGS += [
+    _mbdepth("pi05_droid_jointpos_mbdepth_lora", "pi05_droid_jointpos_molmospaces_lora"),
+    _mbdepth("pi05_droid_jointpos_mbdepth_full", "pi05_droid_jointpos_molmospaces_full"),
+    _mbdepth("pi05_droid_jointpos_mbdepth_rope4d_full", "pi05_droid_jointpos_molmospaces_rope4d_full"),
+]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

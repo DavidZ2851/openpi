@@ -12,17 +12,12 @@ from transformers.models.gemma import modeling_gemma
 class RotaryPositionEmbedding4D(nn.Module):
     """4D Rotary Position Embedding over continuous (x, y, z, t) coordinates.
 
-    Ported from ArticuBot (diffusion_policy/model/flow_matching/helpers.py). Rather
-    than a single integer token index, every token carries a metric position: a 3D
-    point in the robot/world frame plus a normalized time. ``head_dim`` is split
-    across the four axes, each rotated by its own coordinate.
-
-    The channel layout differs from the ArticuBot version: axis blocks are laid out
-    in the first half of the vector and mirrored into the second half, so that
-    HuggingFace's ``rotate_half`` (which pairs channel i with i + head_dim/2) rotates
-    each pair under one shared angle. That makes the emitted cos/sin drop-in
-    compatible with ``modeling_gemma.apply_rotary_pos_emb``. It is the same
-    transform as the per-quarter formulation up to a permutation of channels.
+    Exactly ArticuBot's RotaryPositionEmbedding4D (diffusion_policy/model/flow_matching/helpers.py):
+    ``head_dim`` is split into four equal quarters [x | y | z | t], and each quarter is rotated by
+    its own coordinate with a rotate_half *within the quarter* (channel j paired with j + quarter/2),
+    inv_freq = 1 / base ** (arange(0, quarter, 2) / quarter). This emits that layout's cos/sin;
+    the attention applies them with ``modeling_gemma.apply_rotary_pos_emb`` while
+    ``articubot_rotate_half`` is swapped in for HF's whole-vector rotate_half.
     """
 
     def __init__(self, head_dim: int, base_frequency: float = 100.0):
@@ -30,20 +25,35 @@ class RotaryPositionEmbedding4D(nn.Module):
         if head_dim % 8 != 0:
             raise ValueError(f"head_dim must be divisible by 8 (4 axes x rotation pairs); got {head_dim}")
         self.head_dim = head_dim
-        # Frequencies per axis within the half-vector.
-        self.axis_dim = head_dim // 8
-        inv_freq = 1.0 / (base_frequency ** (torch.arange(self.axis_dim, dtype=torch.float32) / self.axis_dim))
+        self.quarter = head_dim // 4
+        inv_freq = 1.0 / (base_frequency ** (torch.arange(0, self.quarter, 2).float() / self.quarter))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Args: positions (B, L, 4) continuous coords. Returns cos, sin of (B, L, head_dim)."""
         if positions.shape[-1] != 4:
             raise ValueError(f"positions must have a trailing dim of 4 (x, y, z, t); got {tuple(positions.shape)}")
-        # (B, L, 4, 1) * (axis_dim,) -> (B, L, 4, axis_dim), flattened to the half-vector.
+        # (B, L, 4, 1) * (quarter/2,) -> per-axis angles, duplicated within each quarter.
         angles = positions.float().unsqueeze(-1) * self.inv_freq
-        half = angles.flatten(start_dim=-2)
-        emb = torch.cat([half, half], dim=-1)
+        emb = torch.cat([angles, angles], dim=-1).flatten(start_dim=-2)  # (B, L, head_dim)
         return emb.cos(), emb.sin()
+
+
+def articubot_rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """ArticuBot's rotate_half applied to each of the four head_dim quarters separately."""
+    q = x.reshape(*x.shape[:-1], 4, 2, x.shape[-1] // 8)
+    return torch.cat((-q[..., 1, :], q[..., 0, :]), dim=-1).reshape(x.shape)
+
+
+@contextlib.contextmanager
+def _articubot_rotation():
+    """Make modeling_gemma.apply_rotary_pos_emb rotate within quarters (4D RoPE) for this call."""
+    original = modeling_gemma.rotate_half
+    modeling_gemma.rotate_half = articubot_rotate_half
+    try:
+        yield
+    finally:
+        modeling_gemma.rotate_half = original
 
 
 class _Rope4DRotaryAdapter(nn.Module):
@@ -181,6 +191,14 @@ class PaliGemmaWithExpertModel(nn.Module):
         match the token sequence this call processes (prefix only, suffix only, or both).
         When None, behaviour is unchanged.
         """
+        with _articubot_rotation() if positions_4d is not None else contextlib.nullcontext():
+            return self._forward(
+                attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, adarms_cond, positions_4d
+            )
+
+    def _forward(
+        self, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, adarms_cond, positions_4d
+    ):
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:

@@ -175,4 +175,6 @@ def preprocess_observation_pytorch(
         token_loss_mask=observation.token_loss_mask,
         patch_xyz=getattr(observation, "patch_xyz", None),
         eef_xyz=getattr(observation, "eef_xyz", None),
+        rope_joints=getattr(observation, "rope_joints", None),
+        rope_action_affine=getattr(observation, "rope_action_affine", None),
     )

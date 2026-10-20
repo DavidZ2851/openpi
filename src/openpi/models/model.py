@@ -111,6 +111,11 @@ class Observation(Generic[ArrayT]):
     # gripper position, used for the language and action tokens.
     patch_xyz: at.Float[ArrayT, "*b n p 3"] | None = None
     eef_xyz: at.Float[ArrayT, "*b 3"] | None = None
+    # For the action tokens' 4D RoPE xyz (FK of the predicted joints, ArticuBot's "cumsum" placement):
+    # the current arm joints (rad, unnormalized) and the affine (scale, offset) rows that unnormalize
+    # the first 7 action dims (joint deltas): raw = normalized * scale + offset.
+    rope_joints: at.Float[ArrayT, "*b 7"] | None = None
+    rope_action_affine: at.Float[ArrayT, "*b 2 7"] | None = None
 
     # Conditional LoRA inputs (pi0 with cond_lora): metric depth map(s) (0 = invalid), the exterior camera's
     # point cloud in the robot base frame (metres), and the exterior camera's Plücker ray map
@@ -147,6 +152,8 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             patch_xyz=data.get("patch_xyz"),
             eef_xyz=data.get("eef_xyz"),
+            rope_joints=data.get("rope_joints"),
+            rope_action_affine=data.get("rope_action_affine"),
             depth=data.get("depth"),
             point_cloud=data.get("point_cloud"),
             plucker=data.get("plucker"),
@@ -237,6 +244,8 @@ def preprocess_observation(
         token_loss_mask=observation.token_loss_mask,
         patch_xyz=observation.patch_xyz,
         eef_xyz=observation.eef_xyz,
+        rope_joints=observation.rope_joints,
+        rope_action_affine=observation.rope_action_affine,
         depth=observation.depth,
         point_cloud=observation.point_cloud,
         plucker=observation.plucker,

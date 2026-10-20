@@ -7,6 +7,7 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+import openpi.models_pytorch.franka_fk as franka_fk
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -173,12 +174,12 @@ class PI0Pytorch(nn.Module):
         )
 
     def build_positions_4d(self, observation, num_image_tokens: int, num_lang_tokens: int) -> Tensor:
-        """(B, L, 4) 4D RoPE positions for the prefix+suffix sequence, laid out as ArticuBot's.
+        """(B, prefix_len, 4) 4D RoPE positions of the prefix, laid out as ArticuBot's observation tokens.
 
-        Image tokens sit at their patch's 3D point (``observation.patch_xyz``) with t = 0.
-        Language tokens (prompt + discretized state) and action tokens sit at the gripper
-        (``observation.eef_xyz``); t carries their order (1..L for language, then L+1..L+H for
-        actions), so token order is kept. xyz is in rope_4d_xyz_scale units (cm by default).
+        Image tokens sit at their patch's 3D point (``observation.patch_xyz``) with t = 0, the observation
+        step. The text tokens (prompt + discretized state; ArticuBot has no text, its state token sits at the
+        gripper) sit at the gripper (``observation.eef_xyz``) with t = -n..-1 over the n valid tokens, which
+        keeps their order and puts them just before the observation. xyz is in rope_4d_xyz_scale units (cm).
         """
         patch = observation.patch_xyz.to(torch.float32)  # (B, n_img, P, 3)
         eef = observation.eef_xyz.to(torch.float32)  # (B, 3)
@@ -186,15 +187,28 @@ class PI0Pytorch(nn.Module):
         if n_img * n_patch != num_image_tokens:
             raise ValueError(f"patch_xyz covers {n_img}x{n_patch} image tokens, the prefix has {num_image_tokens}")
         scale = self.config.rope_4d_xyz_scale
-        device = patch.device
         img = torch.cat([patch.reshape(bsize, -1, 3) * scale, patch.new_zeros(bsize, num_image_tokens, 1)], dim=-1)
-        num_other = num_lang_tokens + self.config.action_horizon
-        t = torch.arange(1, num_other + 1, device=device, dtype=torch.float32)
-        other = torch.cat(
-            [(eef * scale)[:, None, :].expand(bsize, num_other, 3), t[None, :, None].expand(bsize, num_other, 1)],
-            dim=-1,
-        )
-        return torch.cat([img, other], dim=1)
+        valid = observation.tokenized_prompt_mask.to(torch.float32)  # (B, L); valid tokens come first
+        t = torch.arange(num_lang_tokens, device=patch.device, dtype=torch.float32)[None] - valid.sum(-1, keepdim=True)
+        t = t * valid
+        text = torch.cat([(eef * scale)[:, None, :].expand(bsize, num_lang_tokens, 3), t[..., None]], dim=-1)
+        return torch.cat([img, text], dim=1)
+
+    def build_action_positions_4d(self, observation, x_t: Tensor) -> Tensor:
+        """(B, H, 4) 4D RoPE positions of the action tokens: ArticuBot's action_pos_mode="cumsum".
+
+        ArticuBot places action token k at the gripper plus the cumulative sum of the (noisy, unnormalized)
+        predicted xyz deltas. Our actions are joint deltas from the current joints, so token k sits at the
+        TCP of the joints they predict, FK(rope_joints + unnormalize(x_t[k, :7])), with t = 1 + k (one
+        observation step, then the horizon). No gradient flows through the positions, as in ArticuBot.
+        """
+        with torch.no_grad():
+            affine = observation.rope_action_affine.to(torch.float32)  # (B, 2, 7)
+            deltas = x_t[..., :7].to(torch.float32) * affine[:, None, 0] + affine[:, None, 1]
+            joints = observation.rope_joints.to(torch.float32)[:, None, :] + deltas
+            xyz = franka_fk.tcp_position(joints) * self.config.rope_4d_xyz_scale  # (B, H, 3)
+            t = torch.arange(1, x_t.shape[1] + 1, device=x_t.device, dtype=torch.float32)
+            return torch.cat([xyz, t[None, :, None].expand(x_t.shape[0], -1, 1)], dim=-1)
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -361,8 +375,14 @@ class PI0Pytorch(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if positions_4d is None and self.config.rope_4d:
-            positions_4d = self.build_positions_4d(
-                observation, prefix_embs.shape[1] - lang_tokens.shape[1], lang_tokens.shape[1]
+            positions_4d = torch.cat(
+                [
+                    self.build_positions_4d(
+                        observation, prefix_embs.shape[1] - lang_tokens.shape[1], lang_tokens.shape[1]
+                    ),
+                    self.build_action_positions_4d(observation, x_t),
+                ],
+                dim=1,
             ).to(prefix_embs.device)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -427,7 +447,9 @@ class PI0Pytorch(nn.Module):
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        if positions_4d is None and self.config.rope_4d:
+        # With rope_4d the action tokens' positions follow x_t, so they are rebuilt at every denoise step.
+        dynamic_suffix = positions_4d is None and self.config.rope_4d
+        if dynamic_suffix:
             positions_4d = self.build_positions_4d(
                 observation, prefix_embs.shape[1] - lang_tokens.shape[1], lang_tokens.shape[1]
             ).to(prefix_embs.device)
@@ -444,7 +466,7 @@ class PI0Pytorch(nn.Module):
         prefix_positions_4d = suffix_positions_4d = None
         if positions_4d is not None:
             prefix_positions_4d = positions_4d[:, :prefix_len]
-            suffix_positions_4d = positions_4d[:, prefix_len:]
+            suffix_positions_4d = None if dynamic_suffix else positions_4d[:, prefix_len:]
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -468,7 +490,9 @@ class PI0Pytorch(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
-                positions_4d=suffix_positions_4d,
+                positions_4d=(
+                    self.build_action_positions_4d(observation, x_t) if dynamic_suffix else suffix_positions_4d
+                ),
             )
 
             # Euler step - use new tensor assignment instead of in-place operation

@@ -128,7 +128,11 @@ class MolmoSpacesToDroidRope4D(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class DroidRope4DInputs(droid_policy.DroidInputs):
-    """DroidInputs plus Observation.patch_xyz (base, left wrist, masked right wrist) and eef_xyz."""
+    """DroidInputs plus Observation.patch_xyz (base, left wrist, masked right wrist), eef_xyz, and for the
+    action tokens' positions the raw arm joints (rope_joints) and the (scale, offset) that unnormalize the
+    joint-delta actions (rope_action_affine, from the data config's action norm stats)."""
+
+    action_affine: tuple[tuple[float, ...], tuple[float, ...]] | None = None
 
     def __call__(self, data: dict) -> dict:
         inputs = super().__call__(data)
@@ -136,6 +140,10 @@ class DroidRope4DInputs(droid_policy.DroidInputs):
         wrist = np.asarray(data["observation/patch_xyz_wrist"], dtype=np.float32).reshape(-1, 3)
         inputs["patch_xyz"] = np.stack([exterior, wrist, np.zeros_like(exterior)])
         inputs["eef_xyz"] = np.asarray(data["observation/eef_xyz"], dtype=np.float32).reshape(3)
+        inputs["rope_joints"] = np.asarray(data["observation/joint_position"], dtype=np.float32).reshape(7)
+        if self.action_affine is None:
+            raise ValueError("DroidRope4DInputs.action_affine is unset (built by LeRobotMolmoSpacesRope4DDataConfig)")
+        inputs["rope_action_affine"] = np.asarray(self.action_affine, dtype=np.float32)
         return inputs
 
 
@@ -202,7 +210,9 @@ class DroidCondInputs(droid_policy.DroidInputs):
             side = int(round(np.sqrt(plucker.shape[1])))
             inputs["plucker"] = plucker.reshape(6, side, side)
         if "observation/intrinsics_exterior" in data:
-            inputs["intrinsics"] = np.asarray(data["observation/intrinsics_exterior"], dtype=np.float32).reshape(1, 3, 3)
+            inputs["intrinsics"] = np.asarray(data["observation/intrinsics_exterior"], dtype=np.float32).reshape(
+                1, 3, 3
+            )
         if "observation/geo_features_exterior" in data:  # (tokens, features), e.g. MapAnything's (256, 1538)
             inputs["geo_features"] = np.asarray(data["observation/geo_features_exterior"], dtype=np.float32)
         if "observation/point_cloud" in data:
